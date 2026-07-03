@@ -72,7 +72,7 @@ config.useMasterSlaveServers()
     .setMasterAddress("redis://192.168.1.10:6379")
     .addSlaveAddress("redis://192.168.1.11:6379", "redis://192.168.1.12:6379");
 
-// ===== 哨兵模式 =====
+// ===== 哨兵模式 =====哨兵模式底层依然是主从复制，它只是增加了“哨兵”这个监管+自动切换层。
 config.useSentinelServers()
     .setMasterName("mymaster")
     .addSentinelAddress("redis://192.168.1.10:26379",
@@ -216,7 +216,7 @@ public void innerMethod() {
 
 **对应的 Java 概念：** `ReentrantReadWriteLock`
 
-**解决什么问题？** 有些场景中，"读操作"可以并发，"写操作"必须互斥。普通锁读读也互斥，浪费性能。
+**解决什么问题？** 有些场景中，"读操作"可以并发，"写操作"必须互斥:rocket::rofl::rofl::rofl:。普通锁读读也互斥，浪费性能。
 
 ```
 RReadWriteLock 的规则（跟 Java 的 ReentrantReadWriteLock 完全一样）：
@@ -307,12 +307,12 @@ semaphore.reducePermits(1);    // 从 5 减到 4
 
 **适用场景：**
 - 限制同时访问数据库的连接数（如上例）
-- 限制同时调用某个第三方 API 的并发数
+- 限制同时调用某个第三方 API 的并发数:rocket::rocket:
 - 限流场景：`permits = 100` 表示最多 100 个并发（信号量限流）
 
 ### 2.4 RPermitExpirableSemaphore —— 可过期的信号量
 
-**对应的 Java 概念：** `Semaphore` 但每个许可有 TTL 限制
+**对应的 Java 概念：** `Semaphore` 但每个许可有 TTL 限制:rocket::rofl::rofl:
 
 **解决什么问题？** 普通 RSemaphore 的许可是永久的——你 `acquire()` 后如果不 `release()`，许可永久不归还。如果线程死了，许可泄露。RPermitExpirableSemaphore 的每个许可有**过期时间**——拿到许可超过 N 秒，许可自动归还。
 
@@ -344,7 +344,7 @@ try {
 | 手动释放指定许可 | 无法（只能 `release()`） | 可以 `release(permitId)` |
 | 适用场景 | 长时间持有的许可 | 短时间许可，超时自动释放 |
 
-### 2.5 RCountDownLatch —— 倒计数门闩
+### 2.5 RCountDownLatch —— 倒计数门闩:rocket:
 
 **对应的 Java 概念：** `CountDownLatch`
 

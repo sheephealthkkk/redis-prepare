@@ -68,7 +68,7 @@ public void unlockV1(String lockKey) {
 }
 ```
 
-**致命问题：** 拿到锁后如果服务宕机，`unlock` 代码没机会执行 → key 永久存在 → **死锁**。
+**致命问题：** 拿到锁后如果服务宕机，`unlock` 代码没机会执行 → key 永久存在 → **死锁**。:rocket::rocket:
 
 #### V2：SETNX + EXPIRE —— 加个过期时间解决死锁？
 
@@ -86,7 +86,7 @@ public boolean tryLockV2(String lockKey, String lockValue) {
 }
 ```
 
-**致命问题：SETNX 和 EXPIRE 是两条独立命令，中间可能宕机。** 一个命令执行完，第二个命令还没发出去，进程被 kill -9 → 锁设置了但没有过期时间 → 死锁。
+**致命问题：SETNX 和 EXPIRE 是两条独立命令，中间可能宕机。** 一个命令执行完，第二个命令还没发出去，进程被 kill -9 → 锁设置了但没有过期时间 → 死锁。:rocket:
 
 #### V3：SET ... NX PX —— 原子操作
 
@@ -109,7 +109,7 @@ public boolean tryLockV3(String lockKey, String lockValue) {
 }
 ```
 
-**新问题——误删别人的锁：**
+**新问题——误删别人的锁：**过期之后解锁，解的锁不是自己的锁:rocket::rocket:
 
 ```
 时间线：
@@ -124,7 +124,7 @@ public boolean tryLockV3(String lockKey, String lockValue) {
 
 **根本原因：释放锁时没有验证"这把锁是不是我的"。**
 
-#### V4：释放时验证身份（Lua 原子脚本）
+#### V4：释放时验证身份（Lua 原子脚本）:rocket::rocket:
 
 ```java
 /**
@@ -166,7 +166,7 @@ public class RedisLockV4 {
 
 **为什么 lockValue 是 UUID:线程名？** 不同 JVM 实例可能生成相同的 UUID（极低概率），加上线程名确保**全局唯一**可辨识。
 
-#### V1-V4 还没解决的问题：过期时间到底设多长？
+#### V1-V4 还没解决的问题：过期时间到底设多长？:rocket::rocket::rocket:
 
 ```
 设短了（如 5 秒）→ 业务调第三方接口花了 6 秒 → 锁过期被别人拿走 → 并发
@@ -213,7 +213,7 @@ if (lock.tryLock(3, 30, TimeUnit.SECONDS)) {  // 最多等 3 秒，锁持有 30 
 }
 ```
 
-**关键区别：** `lock()` 启动看门狗，锁永不过期（只要你还在跑）。`tryLock(wait, leaseTime, unit)` 指定了 leaseTime，**不启动看门狗**，到期就释放。
+**关键区别：** :rocket::rocket::rocket:`lock()` 启动看门狗，锁永不过期（只要你还在跑）。`tryLock(wait, leaseTime, unit)` 指定了 leaseTime，**不启动看门狗**，到期就释放。
 
 #### 1.3.2 Redisson 用 Hash 存锁——为什么？
 
@@ -226,7 +226,47 @@ Redis 中的实际存储：
   Value: 1                              ← 可重入计数
 ```
 
-**为什么用 Hash？两个原因：**
+| Redis 数据类型 | Key（锁名） | Field（谁持有锁） | Value（重入次数） |
+| :------------- | :---------- | :---------------- | :---------------- |
+| Hash           | `myLock`    | `UUID:threadId`   | 1（初始值）       |
+
+
+
+:rocket::rocket::rocket::rocket::rocket::rocket::rocket:
+
+`ARGV` 是一个**数组**
+
+### “数组”其实来自 Lua 脚本的 `ARGV`
+
+在加锁/解锁的 Lua 脚本里，`ARGV` 是一个**脚本参数数组**，它是调用 `EVAL` 时传进去的**一系列字符串**。
+
+lua
+
+```
+-- 解锁脚本
+if redis.call('hexists', KEYS[1], ARGV[3]) == 0 then ... end
+```
+
+
+
+- `ARGV[1]`、`ARGV[2]`、`ARGV[3]` 是三个**独立的参数**，被 Lua 解释器放在一个叫 `ARGV` 的 table（类似数组）里。
+- 它们分别是：解锁消息、过期时间、客户端标识。
+- 每个参数只是一个**普通的字符串**，比如 `ARGV[3]` 就是 `"e7b1a3c2-...:1"`，绝不会被存成一个“多含义的数组元素”。
+
+**Hash 的 value 没有存储这个数组，它只存重入计数。**hash的key，field，value都没有存它，它是存的脚本层面的内容。
+ARGV 只是脚本执行时的临时输入，用完就没了。:rocket::rocket::rocket::rocket::rocket::rocket:
+
+
+
+
+
+
+
+
+
+
+
+**为什么用 Hash？两个原因：**:rocket::rocket::rocket:
 
 **原因一：可重入。** 同一个线程可以多次调用 `lock()`，count 累加；`unlock()` 时 count 递减，减到 0 才真正释放锁。
 
@@ -266,14 +306,15 @@ end;
 return redis.call('pttl', KEYS[1]);
 ```
 
-**这段脚本解释了三件事：**
+**这段脚本解释了三件事：**:rocket::rocket:
+
 1. 锁是 Hash，field 是客户端标识，value 是重入计数
 2. 同线程重复 lock() 不会死锁（可重入）
 3. 返回 TTL 让等待方知道 "大概还要等多少毫秒"，不用盲目轮询
 
 #### 1.3.4 看门狗（Watchdog）—— 自动续期
 
-看门狗是 Redisson 的杀手级特性。它解决的核心矛盾是：**"不设过期怕死锁，设了过期怕没执行完"**。
+看门狗是 Redisson 的杀手级特性。它解决的核心矛盾是：**"不设过期怕死锁，设了过期怕没执行完"**。:rocket::rocket::rocket:
 
 ```
 工作流程：
@@ -289,7 +330,7 @@ return redis.call('pttl', KEYS[1]);
 **看门狗源码（RedissonLock.java 简化）：**
 
 ```java
-// 全局 Map：存储每个锁对象的续期任务
++// 全局 Map：存储每个锁对象的续期任务
 // key = 锁的唯一标识, value = 续期任务信息
 // 这样 unlock() 时可以根据锁标识找到对应的续期任务来取消它
 private static final ConcurrentMap<String, ExpirationEntry> EXPIRATION_RENEWAL_MAP
@@ -309,7 +350,7 @@ private void renewExpiration() {
         .newTimeout(timeout -> {
 
             // ③ 异步执行续期 Lua 脚本
-            // if redis.call('hexists', KEYS[1], ARGV[2]) == 1 then
+            // if redis.call('+hexists', KEYS[1], ARGV[2]) == 1 then
             //     redis.call('pexpire', KEYS[1], ARGV[1])  ← 重置为 30 秒
             //     return 1
             // end
@@ -367,7 +408,7 @@ end;
 
 #### 1.3.6 tryLock 等待机制——不是轮询
 
-加锁失败后，Redisson 不是 `while(true) + sleep` 那种 CPU 空转，而是 **Pub/Sub + 信号量**：
+加锁失败后，Redisson 不是 `while(true) + sleep` 那种 CPU 空转，而是 **Pub/Sub + 信号量**：:rocket::rocket::rocket::rocket:
 
 ```
 ① tryLock(3秒) → Lua 加锁失败 → 返回剩余 TTL（如 25 秒）
@@ -377,11 +418,13 @@ end;
 ⑤ 3 秒内抢到了 → 返回 true；超时 → 返回 false
 ```
 
+
+
 ### 1.4 理解"主从切换为什么导致锁失效"——红锁的前置知识
 
 #### 1.4.1 Redis 主从复制的本质：异步
 
-在你理解红锁之前，必须先理解 **Redis 主从之间是怎么同步数据的**。
+在你理解红锁之前，必须先理解 **Redis 主从之间是怎么同步数据的**。:rocket::rocket::rocket::rocket::rocket::rocket:
 
 ```
 正常情况下的主从同步：
@@ -399,7 +442,7 @@ end;
 
 **这个窗口就是一切问题的根源。** 正常情况下这个窗口只有几毫秒，但万一 Master 恰好在这个窗口内宕机了呢？
 
-#### 1.4.2 主从切换（Failover）下的锁失效场景
+#### 1.4.2 主从切换（Failover）下的锁失效场景:rocket::rocket::rocket::rocket::rocket::rocket:
 
 ```
 场景图：
@@ -446,7 +489,7 @@ Redis 作者 antirez 提出了 RedLock 算法。核心思想很直接：**不要
                                   过半（≥3）成功 → 锁才有效
 ```
 
-**关键决策：** 不用主从复制，而是 5 个完全独立的 Redis 实例（不互相复制，各存各的）。锁同时写到这 5 个节点上，需要大多数（≥3）写成功，才算拿到锁。
+**关键决策：** 不用主从复制，而是 5 个完全独立的 Redis 实例（不互相复制，各存各的）。锁同时写到这 5 个节点上，需要大多数（≥3）写成功，才算拿到锁。:rocket::rocket::rocket::rocket::rocket::rocket:
 
 #### 1.5.2 红锁算法的完整执行步骤
 
@@ -490,9 +533,9 @@ Redisson 用法：
   lock.lock();
 ```
 
-**为什么必须"过半"？** 这是分布式共识的基本法则。如果两个客户端同时抢锁，它们不可能同时获得大多数节点的成功——因为每个节点只能被一个客户端 SET NX 成功。这是靠 NX 条件保证的。
+**为什么必须"过半"？** 这是分布式共识的基本法则。如果两个客户端同时抢锁，它们不可能同时获得大多数节点的成功——因为每个节点只能被一个客户端 SET NX 成功。这是靠 NX 条件保证的。:rocket::rocket::rocket:
 
-**为什么总耗时必须 < TTL？** 因为从第一个节点 SET 成功到最后一个节点 SET 成功之间拖了时间，锁的实际剩余有效时间变短了。如果总耗时接近或超过 TTL，说明这条锁实际上已经没保护了。
+**为什么总耗时必须 < TTL？** 因为从第一个节点 SET 成功到最后一个节点 SET 成功之间拖了时间，锁的实际剩余有效时间变短了。如果总耗时接近或超过 TTL，说明这条锁实际上已经没保护了。:rocket:
 
 #### 1.5.3 红锁仍然不安全——一个经典的反驳
 
@@ -520,13 +563,13 @@ Redisson 用法：
 ```
 
 **Martin 的核心观点：**
-- 锁的"过期时间"依赖系统时钟，但分布式系统中时钟不是完美的（时钟漂移、NTP 对时、GC 暂停等）
+- 锁的"过期时间"依赖系统时钟，但分布式系统中时钟不是完美的（时钟漂移、NTP 对时、GC 暂停等）:rocket:
 - 无法保证"我以为锁还在"和"锁确实还在"之间的正确对应
 - **正确的分布式锁应该用单调递增的版本号（fencing token），而不是依赖时钟**
 
 **antirez 的回应：**
 - RedLock 不需要精确时钟，只需要"时钟偏差 < TTL"这个宽松假设
-- GC 暂停问题可以通过调整 TTL 来缓解（TTL 远大于 GC 暂停时间）
+- GC 暂停问题可以通过调整 TTL 来缓解（TTL 远大于 GC 暂停时间）:rocket:
 - 完全脱离时钟的锁不存在——就算是 ZooKeeper 的 ephemeral 节点也需要心跳超时（本质上也是时间）
 
 **这场争论没有绝对赢家，但它告诉我们一个道理：** 如果你的业务对一致性的要求到了"不容半点偏差"的地步，就不要用 Redis 锁——用 ZooKeeper 或 etcd。
@@ -649,7 +692,7 @@ vs Redis Sentinel：
 - **ZooKeeper 锁为什么比 Redis 安全？** → 临时节点 + Session 心跳 → 崩溃即时检测（不用等 TTL）；ZAB 协议过半写入 → 强一致性
 - **什么时候用 Redis 锁，什么时候用 ZK？** → Redis：性能高、运维简单、接受偶尔失效 → 99% 互联网业务。ZK/etcd：强一致性要求 → 金融/支付
 
----
+
 
 ## 2. 限流
 
@@ -700,9 +743,9 @@ vs Redis Sentinel：
   问题 2：扩缩容要重新算——加了第 4 台 → 每台 250 → 要改配置重启
 ```
 
-**核心矛盾：** 单机限流感知不到全局。集群的总流量是各实例流量的总和，但单个实例不知道别的实例在做什么。
+**核心矛盾：** 单机限流感知不到全局:rocket::rocket:。集群的总流量是各实例流量的总和，但单个实例不知道别的实例在做什么。
 
-#### 2.1.3 解决方案——所有实例去同一个地方计数
+#### 2.1.3 解决方案——所有实例去同一个地方计数:rocket::rocket::rocket::rocket::rocket::rocket:
 
 ```
 分布式限流：
@@ -747,7 +790,7 @@ public boolean fixedWindow(String userId) {
 }
 ```
 
-**固定窗口的漏洞——临界问题：**
+**固定窗口的漏洞——临界问题：**:rocket::rocket:
 
 ```
 窗口：每分钟最多 10 次
@@ -787,44 +830,87 @@ public boolean fixedWindow(String userId) {
  *   "删旧数据 + 计数 + 判断 + 加新数据" 四步必须原子，
  *   否则多个请求可能同时通过判断，都认为自己没超限。
  */
+/**
+ * 滑动窗口限流（基于 Redis ZSET + Lua 原子操作）
+ *
+ * @param userId    用户标识
+ * @param limit     窗口内允许的最大请求次数
+ * @param windowSec 窗口大小（秒）
+ * @return true=放行， false=限流拒绝
+ */
 public boolean slidingWindow(String userId, int limit, int windowSec) {
-    String key = "rate:sliding:" + userId;     // Redis key
-    long now = System.currentTimeMillis();      // 当前时间戳（毫秒）
-    long windowStart = now - windowSec * 1000L; // 窗口起点 = 60 秒前
+    // 1. 拼接 Redis key，每个用户一个独立的 ZSET
+    //    例如: "rate:sliding:user_123"
+    String key = "rate:sliding:" + userId;
 
+    // 2. 获取当前时间戳（毫秒），作为本次请求的发生时间
+    long now = System.currentTimeMillis();
+
+    // 3. 计算滑动窗口的左边界（最早有效时间）
+    //    超过这个时间戳的请求记录都要被删除
+    long windowStart = now - windowSec * 1000L;
+
+    // 4. 定义 Lua 脚本，保证“清理 + 统计 + 判断 + 记录”四步原子执行
     String lua =
-        // ① 删除窗口外的旧数据（score 在 0 ~ windowStart 之间的全部删掉）
+        // ---------- 第 1 步：删除窗口外的旧数据 ----------
+        // ZREMRANGEBYSCORE key min max
+        // 删除 score 在 [0, windowStart] 之间的所有成员（即过期的请求记录）
         "redis.call('ZREMRANGEBYSCORE', KEYS[1], 0, ARGV[1]) " +
 
-        // ② 统计窗口内还剩几条请求
+        // ---------- 第 2 步：统计窗口内还剩多少条请求 ----------
+        // ZCARD key  返回有序集合的成员数量
         "local count = redis.call('ZCARD', KEYS[1]) " +
 
-        // ③ 判断：窗口内请求数 < 限制？
+        // ---------- 第 3 步：判断是否超过限制 ----------
+        // ARGV[2] 是字符串类型的 limit，需要转成数字再比较
         "if count < tonumber(ARGV[2]) then " +
-        "    redis.call('ZADD', KEYS[1], ARGV[3], ARGV[4]) " +  // ④ 是 → 记录本次请求
-        "    redis.call('EXPIRE', KEYS[1], ARGV[5]) " +          // ⑤ 设 key 过期
-        "    return 1 " +                                         // ⑥ 放行
+
+        // ---------- 第 4 步：未超限，放行，记录本次请求 ----------
+        // ZADD key score member  将本次请求加入 ZSET
+        // score = 当前时间戳（ARGV[3]），member = UUID（ARGV[4]）
+        "    redis.call('ZADD', KEYS[1], ARGV[3], ARGV[4]) " +
+
+        // ---------- 第 5 步：刷新 key 的过期时间 ----------
+        // EXPIRE key seconds  设置 TTL，避免冷用户长期占用内存
+        // 过期时间比窗口稍长（windowSec + 1），保证窗口数据完整
+        "    redis.call('EXPIRE', KEYS[1], ARGV[5]) " +
+
+        // 返回 1 表示放行
+        "    return 1 " +
+
         "else " +
-        "    return 0 " +                                         // ⑦ 拒绝
+        // ---------- 第 6 步：超限，拒绝 ----------
+        // 返回 0 表示限流
+        "    return 0 " +
         "end";
 
-    String memberId = UUID.randomUUID().toString();  // 本条请求的唯一标识
-    Object result = jedis.eval(lua,
-        Collections.singletonList(key),        // KEYS[1]
+    // 5. 生成本次请求的唯一标识（UUID），作为 ZSET 的 member
+    //    这样同一毫秒内的多个请求也能分别记录，不会互相覆盖
+    String memberId = UUID.randomUUID().toString();
+
+    // 6. 执行 Lua 脚本，所有参数通过 KEYS / ARGV 传入
+    Object result = jedis.eval(
+        lua,
+        // KEYS 列表，这里只有一个元素，对应 Lua 中的 KEYS[1]
+        Collections.singletonList(key),
+        // ARGV 列表，顺序和 Lua 脚本中 ARGV[1] ~ ARGV[5] 一一对应
         Arrays.asList(
-            String.valueOf(windowStart),       // ARGV[1] = 窗口起点
-            String.valueOf(limit),             // ARGV[2] = 10
-            String.valueOf(now),               // ARGV[3] = 当前时间戳（score）
-            memberId,                          // ARGV[4] = UUID（member）
-            String.valueOf(windowSec + 1))     // ARGV[5] = TTL 61 秒
+            String.valueOf(windowStart),   // ARGV[1] 窗口左边界（毫秒）
+            String.valueOf(limit),         // ARGV[2] 限流阈值
+            String.valueOf(now),           // ARGV[3] 当前时间戳（score）
+            memberId,                      // ARGV[4] UUID（member）
+            String.valueOf(windowSec + 1)  // ARGV[5] key 的过期秒数
+        )
     );
+
+    // 7. 解析 Lua 返回值：1 表示放行，0 表示限流
     return "1".equals(result.toString());
 }
 ```
 
 **滑动窗口 VS 固定窗口：** 滑动窗口没有"窗口边界"，攻击者在任意 4 秒内的请求量都被平滑限制。代价：每次请求都要 ZREMRANGEBYSCORE（删旧数据）——但 ZSet 元素少时开销极小。
 
-### 2.4 令牌桶——生产环境的工业标准（从零讲起）
+### 2.4 令牌桶——生产环境的工业标准（从零讲起）:rocket::rocket::rocket::rocket::rocket:
 
 #### 2.4.1 滑动窗口有什么不足？
 
@@ -885,6 +971,17 @@ public boolean slidingWindow(String userId, int limit, int windowSec) {
 ```
 
 **这是令牌桶的第一个精髓：桶容量 = rate，用于削峰，防止流量尖刺。**
+
+### 内存占用和实现复杂度更低
+
+| 维度           | 令牌桶                                                | 滑动日志窗口                               |
+| :------------- | :---------------------------------------------------- | :----------------------------------------- |
+| Redis 数据结构 | 1 个 key 存**令牌数 + 最后刷新时间**（Hash / String） | 1 个 ZSET，每个请求存一个 member           |
+| 空间复杂度     | O(1)                                                  | O(窗口内请求数)，高并发时大量成员          |
+| 每次请求操作   | 读取、计算、写回（几个 HINCRBY 或 Lua 原子操作）      | 删除过期 + 统计 + 插入新成员               |
+| 清理机制       | 无需主动删除，计算时基于时间差补充令牌                | 每次都要 `ZREMRANGEBYSCORE` 删除窗口外数据 |
+
+令牌桶只需记录“当前令牌数”和“上次生成令牌的时间”，每条请求消耗一个令牌，逻辑非常简单，不产生历史数据堆积。
 
 #### 2.4.3 令牌桶 vs 漏桶——最容易混淆的两个概念
 
@@ -1213,7 +1310,7 @@ redisTemplate.opsForStream().claim(
 
 ## 4. 延时队列
 
-### 4.1 问题：什么叫延时队列？
+### 4.1 问题：什么叫延时队列？:rocket::rocket::rocket::rocket::rocket::rocket:
 
 ```
 不是"来了就处理"，而是"来了等 N 秒再处理"。
@@ -1304,7 +1401,7 @@ while (true) {
 
 **局限：** 后台扫描间隔 100ms，所以精确度在百毫秒级（达不到毫秒级精确）。
 
-### 4.4 生产级方案：ZSet + MQ 混搭
+### 4.4 生产级方案：ZSet + MQ 混搭:rocket::rocket::rocket::rocket::rocket:
 
 ```
 Redis ZSet（延时存储和排序）
@@ -1336,9 +1433,95 @@ RocketMQ / Kafka（可靠投递 + ACK + 消费组）
 
 | 方案 | 做法 | 问题 |
 |------|------|------|
-| IP Hash | Nginx 把同一 IP 永远路由到同一台服务器 | 扩容缩容破坏粘性；服务器宕机 = 该 IP 的所有用户全掉 |
+| IP Hash:rocket::rocket::rocket::rocket: | Nginx 把同一 IP 永远路由到同一台服务器 | 扩容缩容破坏粘性；服务器宕机 = 该 IP 的所有用户全掉 |
 | Session 复制 | Tomcat 集群间互相同步 Session | 网络开销大；内存冗余（每个节点存全量 Session） |
 | **Redis 集中存储** | **Session 存 Redis，所有服务器共享** | **多一次网络调用；但架构干净** |
+
+**IP Hash**:rocket::rocket::rocket::rocket::rocket:
+
+### 基本原理
+
+1. **获取客户端 IP**
+   比如 `192.168.1.100`。
+2. **计算哈希值**
+   用某种哈希算法（CRC32、MD5、FNV 等）把 IP 字符串转换为一个数字。
+3. **取模映射到节点**
+   假设有 N 个服务器，用 `hash % N` 得到 0 ~ N-1 的编号，决定路由到哪台服务器。
+
+> **公式：** `target_server = hash(客户端IP) % 节点总数`
+
+这样，同一个 IP 的请求会被**始终路由到同一台后端服务器**，直到节点数量发生变化。
+
+###  IP Hash 的缺点和问题
+
+#### 4.1 负载不均衡
+
+哈希函数并不能保证绝对均匀。如果少数 IP 发送大量请求（如公司出口网关、代理服务器），会造成**单点过热**，某台服务器压力巨大而其他服务器空闲。
+
+#### 4.2 后端节点变化导致重映射
+
+当添加或移除服务器时，`hash % N` 的 `N` 改变，会导致**大量用户重新分配到不同服务器**，所有 Session 全部丢失（发生“缓存雪崩”）。
+
+> 例如原本 3 台服务器，`hash(ip) % 3 = 1` 路由到 server2。当增加第 4 台时，取模变为 `% 4`，结果很可能变成另外一台，导致用户 Session 失效。
+
+#### 4.3 NAT 与代理问题
+
+- 很多用户通过同一个出口 IP 上网（如学校、公司、运营商 NAT），这些用户会被误认为同一个 IP，全部路由到同一台服务器，加剧负载不均。
+- 使用正向代理或 CDN 时，后端看到的 IP 可能是代理的 IP，而不是真实客户端 IP。此时需要正确获取 `X-Forwarded-For` 或 `X-Real-IP` 头。
+- 演进：一致性hash
+
+###  一致性哈希的核心思想:rocket::rocket::rocket::rocket::rocket:
+
+不再将 IP 和服务器做**线性取模**，而是把**服务器节点**和**数据 key（如 IP）**都哈希到一个**环形空间**（哈希环）上，数据按照顺时针方向找到离自己最近的节点。
+
+#### 哈希环（Hash Ring）
+
+- 选择一个固定的整数范围，比如 `0` ~ `2^32 - 1`（0 到大约 43 亿），首尾相连形成一个圆。
+- 每个服务器节点通过相同的哈希算法（如 MD5、FNV）计算出一个哈希值，映射到环上的某个点。
+- 每个请求的 key 也计算出哈希值，落在环上。
+- **路由规则**：从 key 的位置出发，顺时针遇到的第一个节点就是负责处理该 key 的服务器。
+
+#### 示例
+
+text
+
+```
+环范围：[0, 2^32 - 1]  (顺时针方向)
+节点：
+  Server A 哈希在 1000 位置
+  Server B 哈希在 5000 位置
+  Server C 哈希在 9000 位置
+
+请求 key1 哈希在 4000 → 顺时针遇到 B → 分配给 Server B
+请求 key2 哈希在 9500 → 顺时针越过最大值回到 0，遇到 A → 分配给 Server A
+```
+
+
+
+------
+
+### 动态增减节点：只影响局部数据
+
+#### 增加节点
+
+假设在 `Server A (1000)` 和 `Server B (5000)` 之间新增 `Server D`，哈希在 `3000`：
+
+- 原本落在 `(1000, 5000]` 区间内、被分配给 B 的请求，现在 `(1000, 3000]` 范围内的请求会重新分配给 D。
+- 其他区间（如 `(5000, 9000]` 和 `(9000, 1000]`）的数据映射完全不变。
+- **仅影响相邻节点之间的一小段**。
+
+#### 移除节点
+
+`Server B (5000)` 宕机：
+
+- 原本分配给 B 的请求（落在 `(1000, 5000]`）将自动顺时针移动到下一个节点 `C (9000)`。
+- 其他节点数据无影响。
+
+这就把节点变更的影响降到了最低，是分布式缓存、负载均衡等场景的基石。
+
+
+
+redis集中存储
 
 ### 5.2 Spring Session + Redis 实现
 

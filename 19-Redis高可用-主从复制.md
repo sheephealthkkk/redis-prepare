@@ -1,485 +1,1557 @@
-# Redis 高可用 —— 主从复制深度详解
+# Redis 主从复制 —— 深入源码级的全景剖解
 
 ---
 
-## 前言：从真实故障理解主从复制的必要性
+## 核心论点（先读我）
 
-假设你的电商平台上线了，所有商品详情页的缓存都在一台 Redis 上。这台 Redis 的 `maxmemory` 设为 16GB，存放了约 10GB 的热点商品数据。每天有 200 万用户访问商品详情，Redis 承担了 95% 的读流量，MySQL 只处理 5% 的穿透请求。
+> Redis 主从复制的本质是：**把一台 Redis 的写操作，异步地传播到另一台或多台 Redis 上**。这不是 CP 系统的一致性复制，而是 AP 系统的最终一致性。理解「异步」二字，就理解了一切。
 
-某天凌晨 2 点，运维在例行检查时发现 Redis 的内存使用率爬到了 99%。排查发现是上午上线的推荐系统 bug 导致大量推荐结果被缓存且没有设置 TTL。运维重启了 Redis 进程试图释放内存——结果灾难发生了：
-
-```
-Redis 重启的后果链条：
-
-  ① Redis 进程被终止 → 10GB 数据瞬间消失
-  ② 所有的商品详情请求 cache miss → 全部穿透到 MySQL
-  ③ MySQL 平时只承接 5% 的流量（约 1000 QPS），现在承接 100%（约 20000 QPS）
-  ④ MySQL CPU 瞬间飙到 100%，所有查询开始超时
-  ⑤ 下单、支付、退款等核心业务也依赖 MySQL → 连锁反应 → 整个系统瘫了
-  ⑥ Redis 重启完成 → 但缓存是空的 → 依然全部 miss → DB 依然被打
-  ⑦ 需要从 MySQL 加载 10GB 数据到 Redis → 大约 5-10 分钟 → 这段时间用户看到的全是超时
-```
-
-这就是单机 Redis 最可怕的痛点：**Redis 重启或宕机后，缓存全部丢失，需要从零重建。** 重建期间，DB 承受全部流量——多数时候直接被压垮。
-
-而主从复制解决的就是这个问题：**一台 Redis 不可用时，有一台或多台"热备份"随时可以顶上，缓存不丢，服务不断。**
+本文从三个层面展开：
+1. **What**：每个阶段都在干什么
+2. **Why**：为什么这样设计（源码设计决策）
+3. **How**：出问题时怎么排查和调优
 
 ---
 
-## 第一章：主从复制能做什么？
+## 第一章：为什么需要主从复制
 
-### 1.1 三个核心价值
-
-很多同学以为主从复制只是"多存一份数据"。实际上它的价值远不止于此：
-
-**价值一：数据冗余——热备份**
-
-主从复制最直接的价值是给 Master 配备一个"影子"——Slave。Master 上每一条写命令，Slave 都会收到并执行，保证 Slave 的数据和 Master 基本一致。Master 宕机时，Slave 已经有一份完整的数据副本，可以立即接管，不需要从零重建缓存。
-
-这和 MySQL 的主从复制思路完全一样——但 Redis 的实现简单得多。MySQL 需要 binlog、redo log、undo log 三层日志才能完成复制和事务恢复。Redis 没有事务回滚，不需要那么复杂的日志体系——直接把"写命令"发给 Slave 就行。
-
-**价值二：读写分离——分摊读压力**
-
-大多数互联网业务是"读多写少"——商品详情页的读取量可能是库存写入量的 100 倍。如果所有请求都压在 Master 一台机器上，即使 Redis 能撑住，网络带宽也会成为瓶颈——一个 64GB 内存的 Redis Master，每秒处理 10 万次 GET 请求，每次返回 5KB，出流量就是 500MB/s——千兆网卡已经被打满。
-
-读写分离让 Master 只处理写操作，读操作分摊到多个 Slave 上。如果部署了 3 个 Slave，每个 Slave 承担三分之一的读流量，每个 Slave 的出流量降到 167MB/s。同时 Master 的 CPU 也从处理大量 GET 中解放出来，专注于写操作和主从复制。
-
-**价值三：为 Sentinel 和 Cluster 提供底层能力**
-
-Sentinel（哨兵）的自动故障转移和 Cluster（集群）的分片，都依赖主从复制。Sentinel 只是在主从架构的基础上增加了"自动监测"和"自动切换"的能力。Cluster 是在多个主从对的基础上增加了"数据分片"和"跨分片路由"的能力。没有主从复制就没有高可用方案。
-
-### 1.2 主从复制的基本拓扑
+### 1.1 三大价值维度
 
 ```
-═══════════════════════════════════════════════════════════════
-                主从复制的几种拓扑结构
-═══════════════════════════════════════════════════════════════
+没有主从复制的单体 Redis：
+┌─────────────────────────────┐
+│       Client 层              │
+│   ┌──┐ ┌──┐ ┌──┐ ┌──┐      │
+│   └──┘ └──┘ └──┘ └──┘      │
+│      │    │    │    │       │
+│      ▼    ▼    ▼    ▼       │
+│   ┌──────────────────┐      │
+│   │   单台 Redis      │      │
+│   │   (读+写都在这里)  │      │
+│   └──────────────────┘      │
+│                              │
+│   问题                       │
+│   1. 这台挂了，全部不可用      │
+│   2. 10w QPS 全打这一台       │
+│   3. 无法做在线扩展           │
+└─────────────────────────────┘
 
-① 一主一从（最简单的部署）：
-  ┌──────────┐  复制  ┌──────────┐
-  │  Master  │──────▶│  Slave   │
-  │  (读写)  │       │  (只读)   │
-  └──────────┘       └──────────┘
-  适用：数据量小、读压力不大、只需要热备份
-
-② 一主多从（最常见的部署）：
-                  复制
-  ┌──────────┐───────▶ ┌──────────┐
-  │  Master  │────────▶│  Slave-1 │
-  │  (读写)  │────────▶│  Slave-2 │
-  └──────────┘         │  Slave-3 │
-                       └──────────┘
-  适用：读压力大，需要多个 Slave 分摊
-
-③ 链式复制（级联）：
-  ┌──────────┐  复制  ┌──────────┐  复制  ┌──────────┐
-  │  Master  │──────▶│  Slave-1 │──────▶│  Slave-2 │
-  │  (读写)  │       │ (中转+读) │       │  (只读)   │
-  └──────────┘       └──────────┘       └──────────┘
-  适用：Slave 太多时，减轻 Master 的复制压力
-  Slave-1 同时作为"从"（对 Master）和"主"（对 Slave-2）
-  注意：链路过长会导致末端的 Slave 延迟累积
-
-═══════════════════════════════════════════════════════════════
+引入一主多从后：
+┌─────────────────────────────────────────────┐
+│                Client 层                      │
+│   ┌──┐ ┌──┐ ┌──┐ ┌──┐ ┌──┐ ┌──┐           │
+│   └──┘ └──┘ └──┘ └──┘ └──┘ └──┘           │
+│     │    │    │    │    │    │              │
+│     ▼    ▼    ▼    ▼    ▼    ▼              │
+│   ┌────────────────────────────┐            │
+│   │   Master（仅处理写请求）    │            │
+│   │   QPS: ~1w (写)            │            │
+│   └──────┬──────────┬──────────┘            │
+│          │ 异步复制  │ 异步复制               │
+│          ▼           ▼                       │
+│   ┌──────────┐ ┌──────────┐ ┌──────────┐    │
+│   │ Replica1  │ │ Replica2  │ │ Replica3  │    │
+│   │ 只读       │ │ 只读       │ │ 只读       │    │
+│   │ QPS:~3w   │ │ QPS:~3w   │ │ QPS:~3w   │    │
+│   └──────────┘ └──────────┘ └──────────┘    │
+│                                              │
+│   收益                                       │
+│   1. 读写分离 → 读 QPS 水平扩展 3 倍          │
+│   2. 数据冗余 → 一台挂了还有其他副本           │
+│   3. 架构演进 → 为哨兵/集群打基础              │
+└─────────────────────────────────────────────┘
 ```
+
+| 维度 | 没有主从 | 有主从 |
+|------|---------|--------|
+| **性能** | 读写全压在一台，QPS 上限 = 单机上限 | 读请求分散到多台，写瓶颈不变但读可水平扩展 |
+| **可靠性** | 单点故障，数据全丢 | 多副本冗余，主库挂了数据还在 |
+| **架构演进** | 死胡同 | 为 Sentinel（哨兵）/ Cluster（集群）铺路 |
+
+**面试金句：** "主从复制是 Redis 高可用的基石。没有它，哨兵无从监控，集群无从分片。它是 Redis 从单体走向分布式的第一步。"
 
 ---
 
-## 第二章：主从复制的配置与首次同步
+## 第二章：主从复制的配置方式
 
-### 2.1 最简配置
-
-主从复制的配置出奇的简单——只有一行：
+### 2.1 `replicaof` vs `slaveof`:rocket:
 
 ```bash
-# Slave 的 redis.conf 中配置
-replicaof <Master的IP> <Master的端口>
+# Redis 5.0 之前（仍然可用，但已标记为 deprecated）
+SLAVEOF 127.0.0.1 6379
 
-# 例如：
-replicaof 192.168.1.100 6379
+# Redis 5.0 之后（推荐使用）
+REPLICAOF 127.0.0.1 6379
 ```
 
-这行配置告诉 Redis："启动后自动连接 192.168.1.100:6379，把自己变成它的 Slave"。Slave 会主动发起 TCP 连接，向 Master 发送 `PSYNC` 命令来启动复制流程。
+**为什么改名？**
+> Redis 作者 antirez 在 2018 年决定将 master/slave 术语替换为 master/replica，并在 5.0 版本中引入了 `REPLICAOF` 命令。这是社区对包容性术语的响应，底层实现完全一致，旧命令仍然可用但建议迁移。
 
-在 Redis 5.0 之前，这个配置叫 `slaveof`——含义一样，只是改了个名。你现在看到的大部分文档和面试题中可能还在用 `slaveof`，但实际上 Redis 源码和配置文件中都已经改为 `replicaof`。
+**源码对应关系**（`server.c`）：
+```c
+// 两个命令指向同一个底层 flag
+// SLAVEOF 和 REPLICAOF 都设置了 REPLICAOF flag
+// 所以执行效果完全一样，只是命令名不同
+{"replicaof", replicaofCommand, ...},
+{"slaveof",   replicaofCommand, ...},  // 同一个处理函数
+```
 
-除了静态配置，也可以动态调整——在 redis-cli 中执行 `REPLICAOF` 命令，不需要修改配置文件也不需要重启：
+### 2.2 配置方式对比
+
+| 方式 | 命令 | 持久性 | 使用场景 |
+|------|------|--------|---------|
+| **配置文件** | `replicaof 192.168.1.100 6379` 写入 redis.conf | 重启后仍生效 | 生产环境固定拓扑 |
+| **动态命令** | `redis-cli> REPLICAOF 192.168.1.100 6379` | 重启后失效 | 在线扩缩容、故障处理 |
+
+**伪终端演示：一主两从搭建**
 
 ```bash
-# 让当前 Redis 变成某台 Master 的 Slave
-127.0.0.1:6380> REPLICAOF 192.168.1.100 6379
+# ============ 第1步：启动三个 Redis 实例 ============
+# Master（端口 6379）
+$ redis-server --port 6379 --daemonize yes
 
-# 停止复制，把 Slave 升级为独立的 Master（Sentinel 故障转移时就用这个）
-127.0.0.1:6380> REPLICAOF NO ONE
+# Replica-1（端口 6380）
+$ redis-server --port 6380 --daemonize yes
+
+# Replica-2（端口 6381）
+$ redis-server --port 6381 --daemonize yes
+
+# ============ 第2步：建立主从关系 ============
+$ redis-cli -p 6380 REPLICAOF 127.0.0.1 6379
+OK
+
+$ redis-cli -p 6381 REPLICAOF 127.0.0.1 6379
+OK
+
+# ============ 第3步：验证 ============
+$ redis-cli -p 6379 INFO replication
+# Replication
+role:master
+connected_slaves:2
+slave0:ip=127.0.0.1,port=6380,state=online,offset=126,lag=0
+slave1:ip=127.0.0.1,port=6381,state=online,offset=126,lag=0
+
+$ redis-cli -p 6380 INFO replication
+# Replication
+role:slave
+master_host:127.0.0.1
+master_port:6379
+master_link_status:up
+slave_read_only:1
+
+# ============ 第4步：验证数据同步 ============
+$ redis-cli -p 6379 SET key1 "hello"
+OK
+
+$ redis-cli -p 6380 GET key1
+"hello"    # ← 数据自动同步过来了
 ```
 
-### 2.2 复制状态查看
+### 2.3 replica-read-only：为什么从库默认只读？
 
-```bash
-# 查看当前实例的主从状态
-127.0.0.1:6379> INFO replication
-
-# === Master 侧的典型输出 ===
-# role:master
-# connected_slaves:2                    ← 当前有 2 个 Slave 连接
-# slave0:ip=192.168.1.101,port=6379,state=online,offset=1234567,lag=0
-# slave1:ip=192.168.1.102,port=6379,state=online,offset=1234567,lag=1
-# master_replid:837...c4a              ← Master 的复制 ID
-# master_repl_offset:1234567           ← 当前复制偏移量
-
-# === Slave 侧的典型输出 ===
-# role:slave
-# master_host:192.168.1.100
-# master_port:6379
-# master_link_status:up                ← up=连接正常, down=断开
-# master_last_io_seconds_ago:0         ← 上次收到 Master 数据距今多少秒
-# master_sync_in_progress:0            ← 是否正在全量同步（1=是）
-# slave_repl_offset:1234567            ← 当前已复制的偏移量
+```
+│  Master                                       │  Replica
+│  SET key "value"  ✅ 可以写                    │  SET key "value"  ❌
+│                                                │  -READONLY You can't write against
+│  原因：                                        │    a read only replica.
+│  1. 主从数据一致性——如果从库可写，              │
+│     主库不知道这事，数据立刻出现分歧             │
+│  2. 全量复制时 replica 清空自己全部数据         │
+│     你写过的东西，一个全量复制后就没了            │
+│  3. 如果要「数据预处理」，可以在从库写，          │
+│     但这不是标准做法                            │
 ```
 
-### 2.3 Slave 的读取特性与读写分离落地
+**源码级原理**（`server.c` → `processCommand()`）：
+```c
+// 每个命令执行前都会经过这个检查
+int processCommand(client *c) {
+    // ...
+    // 如果当前实例是 replica，且配置为只读
+    // 并且客户端不是从 master 过来的复制连接
+    // 并且命令不是只读命令
+    if (server.masterhost &&
+        server.repl_slave_ro &&
+        !(c->flags & CLIENT_MASTER) &&
+        !(c->cmd->flags & CMD_READONLY))
+    {
+        addReplyError(c, "READONLY You can't write against a read only replica.");
+        return C_OK;  // 直接拒绝，不会执行
+    }
+    // ...
+}
+```
 
-在 Redis 的主从架构中，默认情况下 Slave 是**只读**的——由 `replica-read-only yes` 控制。这意味着如果你尝试在 Slave 上执行 `SET`、`DEL` 等写命令，Redis 会直接返回错误 `READONLY You can't write against a read only replica`。这么做的目的是防止数据在 Slave 上被意外修改，导致主从不一致。除非你有非常特殊的业务需求（比如在 Slave 上存一些仅本机使用的临时数据），否则永远不要关闭这个配置。
+**追问：如果关闭只读，在 replica 上写入数据会发生什么？**
+- 数据确实会写入 replica 的内存
+- 但这些数据**不会被复制到 master**（复制是单向的：master → replica）
+- 一旦触发全量复制，replica 会**清空自己的所有数据**，包括你写入的那些
+- 如果 replica 被哨兵提升为 master，这些"脏数据"会被带到新的 master 上，造成严重的数据不一致
+- **结论：生产环境绝对不要关闭 replica-read-only**
 
-读写分离在 Java 代码中如何使用？主流 Redis 客户端（Redisson、Lettuce）已经内置了对主从架构的读写分离支持：
+---
 
-```java
-/**
- * 使用 Redisson 的 Master/Slave 模式实现读写分离
- *
- * Redisson 会自动将读命令路由到 Slave，写命令路由到 Master。
- * 当 Master 宕机后，Redisson 会检测到连接断开。
- * 当 Slave 宕机后，Redisson 会把读操作路由到其他健康的 Slave 上。
- */
-@Configuration
-public class MasterSlaveConfig {
+## 第三章：主从复制的核心流程——深入源码级分析
 
-    @Bean
-    public RedissonClient redissonClient() {
-        Config config = new Config();
-        config.useMasterSlaveServers()
-            .setMasterAddress("redis://192.168.1.100:6379")
-            .addSlaveAddress(
-                "redis://192.168.1.101:6379",
-                "redis://192.168.1.102:6379")
-            // ReadMode 控制读操作的路由策略
-            .setReadMode(ReadMode.SLAVE)          // 所有读都走 Slave
-            // .setReadMode(ReadMode.MASTER)      // 所有操作都走 Master
-            // .setReadMode(ReadMode.MASTER_SLAVE) // 读随机分配，均衡负载
-            .setMasterConnectionPoolSize(32)      // Master 连接池
-            .setSlaveConnectionPoolSize(64);      // Slave 连接池（读多，池大一些）
-        return Redisson.create(config);
+### 3.0 全景流程概览
+
+```mermaid
+sequenceDiagram
+    participant R as Replica
+    participant M as Master
+
+    Note over R,M: ① 建立连接
+    R->>M: TCP 连接
+    R->>M: PING（检查连通性）
+    M->>R: +PONG
+
+    Note over R,M: ② 握手与认证
+    R->>M: AUTH <password>（如需要）
+    M->>R: +OK
+    R->>M: REPLCONF listening-port 6380
+    M->>R: +OK
+    R->>M: REPLCONF capa eof/capa psync2
+    M->>R: +OK
+
+    Note over R,M: ③ 同步阶段
+    R->>M: PSYNC ? -1（首次）/ PSYNC replid offset（重连）
+    alt 全量复制
+        M->>R: +FULLRESYNC replid offset
+        M->>R: RDB 文件数据
+        R->>R: 清空旧数据 → 加载 RDB
+    else 部分复制
+        M->>R: +CONTINUE
+        M->>R: 增量命令（从 backlog 中）
+    end
+
+    Note over R,M: ④ 命令传播（进入稳态）
+    loop 持续异步传播
+        M->>M: 执行写命令
+        M->>R: 异步广播写命令
+        R->>R: 执行命令，更新 offset
+    end
+
+    Note over R,M: ⑤ 心跳维护
+    loop 每秒一次
+        R->>M: REPLCONF ACK <offset>
+        M->>M: 更新 replica lag
+    end
+```
+
+### 3.1 建立连接阶段——源码级分析
+
+**核心调用链：**
+
+```
+replica 端（关键源码路径：replication.c）：
+  replicationSetMaster()
+    → connectWithMaster()        // 创建 TCP 连接（非阻塞 socket）
+      → syncWithMaster()         // 主状态机，处理握手全流程
+        → slaveTryPartialResynchronization()  // 发送 PSYNCPSYNC 是 ,Redis 主从复制中的核心命令，全称是 Partial Synchronization（部分同步）
+```
+
+**`syncWithMaster()` 事件处理状态机：**
+
+### 状态机是什么？
+
+**状态机（State Machine）** 是一种编程模型，一个系统在任何时刻都处于**某个状态**，当**某个事件**发生时，系统根据当前状态和事件，执行对应的动作，并转移到下一个状态。
+
+在 Redis 的事件循环中，状态机长这样：
+
+text
+
+```
+while (服务没有停止) {
+    // 等待并收集此刻发生的事件（可读、可写、定时任务）
+    events = 收集事件()
+    
+    // 针对每个事件，调用预先注册的回调函数
+    for 事件 in events {
+        if 事件是"客户端连接"     → 执行连接处理函数
+        if 事件是"命令请求可读"   → 执行命令读取函数
+        if 事件是"回复可写"       → 执行回复发送函数
+        if 事件是"定时任务到期"   → 执行定时任务函数
     }
 }
 ```
 
-在这个配置下，当你调用 `redissonClient.getMap("product:1001").get("name")` 时，Redisson 自动将这个读命令路由到某个 Slave。调用 `redissonClient.getMap("product:1001").put("name", "iPhone")` 则自动路由到 Master。对业务代码来说，完全不需要区分"现在是读还是写"——Redisson 帮你做了这个决定。
+这不是一个复杂的“多状态转换”状态机，而是一个**事件循环 + 回调驱动**的模式，本质上就是**事件驱动的反应式状态机**。它的状态是“当前在处理哪个事件”，事件是“网络 I/O 就绪”或“定时器到期”。
 
----
+```c
+// 源码精简版：replication.c 中的状态机
+// 每个状态对应握手的一个阶段
 
-## 第三章：主从复制的核心流程——深入版
+#define REPL_STATE_CONNECTING 1          // 正在建立 TCP 连接
+#define REPL_STATE_RECEIVE_PONG 2        // 等待 PONG 响应
+#define REPL_STATE_SEND_AUTH 3           // 发送 AUTH
+#define REPL_STATE_RECEIVE_AUTH 4        // 等待 AUTH 响应
+#define REPL_STATE_SEND_PORT 5           // 发送 REPLCONF listening-port
+#define REPL_STATE_RECEIVE_PORT 6        // 等待 REPLCONF 响应
+#define REPL_STATE_SEND_CAPA 7           // 发送 REPLCONF capa（能力协商）
+#define REPL_STATE_RECEIVE_CAPA 8        // 等待 capa 响应
+#define REPL_STATE_SEND_PSYNC 9          // 发送 PSYNC 命令
+#define REPL_STATE_RECEIVE_PSYNC 10      // 等待 PSYNC 响应
 
-### 3.1 从连接到同步的完整过程
-
-当一个 Slave 第一次连接到 Master（或者断开太久后重连），会经历以下三个阶段。这不是简单的"复制粘贴"，而是一个精心设计的有序流程：
-
-```
-第一阶段：建立连接与身份确认
-  Slave 向 Master 发起 TCP 连接 → Master 接受
-  Slave 发送 PING → Master 回复 PONG（确认网络畅通）
-  如果 Master 配置了密码：Slave 发送 AUTH → Master 验证
-  Slave 发送 REPLCONF listening-port <port>（告诉 Master 自己的端口号）
-  Slave 发送 REPLCONF capa eof capa psync2（声明自己支持的能力）
-
-第二阶段：数据同步
-  第一次连接 → 全量同步
-  断线重连 → 先尝试增量同步，不行则全量
-
-第三阶段：命令传播
-  同步完成后，Master 每收到一条写命令，就会把它发给所有 Slave
-  Slave 接收、执行、回复 ACK
+// 为什么设计成状态机？
+// 答案：全流程是异步的。socket 是非阻塞的，每次事件触发只能推进一个状态。
+//      如果做成同步阻塞，一次网络抖动就会卡住整个 replica 进程。
 ```
 
-### 3.2 全量同步——第一次同步的完整过程
+**Redis 的事件处理状态机和 Netty 的核心思想确实一模一样**，因为它们都是基于 **Reactor 模式** 的实现。
 
-全量同步是主从复制中开销最大的操作。每次全量同步都意味着 Master 要 fork 出一个子进程来生成 RDB 快照，然后把快照通过网络发给 Slave。这个过程会消耗 CPU、内存、磁盘 I/O 和网络带宽。
+------
 
-下面按时间线展开全量同步的每一步，解释每一步在做什么以及为什么这么设计：
+### 为什么觉得一样？
 
-**步骤一：Slave 发起同步请求**
+因为它们都遵循同一套“骨架”：
 
-Slave 启动或执行了 `REPLICAOF` 命令后，会主动向 Master 发起一个 TCP 连接。连接成功后，Slave 发送 `PSYNC ? -1` 命令。`?` 表示"我没有 Master 的复制 ID"（因为从来没有同步过），`-1` 表示"我的复制偏移量是 -1"（没有任何数据）。
+1. **事件循环（Event Loop）**
+   - Redis 的 `aeMain` 循环 vs Netty 的 `NioEventLoop` 循环
+   - 都是一个死循环，不断地 `select`（等待事件）→ `dispatch`（分发给 handler）
+2. **非阻塞 I/O + 多路复用**
+   - Redis 封装了 `epoll`/`kqueue`/`select`
+   - Netty 也封装了 `epoll`/`kqueue`（甚至提供 native transport）
+3. **事件驱动回调**
+   - Redis 为每个 `fd` 注册 `rfileProc` / `wfileProc` 回调
+   - Netty 的 `ChannelPipeline` 是一串 `ChannelHandler` 回调链
+4. **单线程事件处理**
+   - Redis 主线程就是单线程 reactor
+   - Netty 的 `NioEventLoop` 内部也是单线程处理 I/O（虽然可以有多个 EventLoop）
 
-**步骤二：Master 执行 BGSAVE**
+**面试追问：为什么握手要分这么多步骤？**
 
-Master 收到 `PSYNC ? -1` 后，判断这是第一次同步——因为 Slave 没有提供有效的 Replication ID。Master 回复 `FULLRESYNC <replid> <offset>`，告诉 Slave"我们要做全量同步，之后你的复制 ID 是 xxx，起始偏移量是 yyy"。
+> 每个步骤解决一个问题：
+> 1. PING/PONG → 确保 master 确实可达且能响应:rocket:
+> 2. AUTH → 安全认证，防止未授权接入:rocket:
+> 3. REPLCONF port → master 需要知道 replica 的端口，用于 `INFO replication` 展示:rocket:
+> 4. REPLCONF capa → **能力协商**:rocket:，replica 告诉 master 自己支持什么特性（如 PSYNC2、eof）
+> 5. PSYNC → 核心同步请求:rockt:
 
-与此同时，Master 开始执行 BGSAVE。BGSAVE 会 fork 一个子进程，子进程拥有 Master 当前内存的一份快照（通过 COW 机制），负责生成 RDB 文件。
 
-**步骤三：replication buffer 缓存增量命令**
 
-在 BGSAVE 子进程写 RDB 的这几秒内，Master 的写操作不能停。如果不停，这些写操作修改的数据不会出现在 RDB 文件中（因为 RDB 是 BGSAVE 开始那一瞬间的快照）。所以 Master 在这段时间内，把所有新来的写命令都暂存在一个叫 **replication buffer** 的内存区域中。
+### 3.2 全量复制（Full Resynchronization）
 
-这个 buffer 是每个 Slave 独占一份的（如果 Master 有 3 个 Slave，就有 3 个独立的 replication buffer）。它的大小不是固定的——它会根据 Slave 的处理速度动态变化。如果 Slave 处理慢，buffer 就会越来越大，直到超出 `client-output-buffer-limit` 限制——此时 Master 会断开这个 Slave 的连接。
+#### 3.2.1 完整时序流程
 
-**步骤四：Master 发送 RDB 给 Slave**
+```mermaid
+sequenceDiagram
+    participant R as Replica
+    participant M as Master
+    participant MF as Master Fork 子进程
+    participant MD as Master 磁盘 (RDB)
 
-BGSAVE 完成后，Master 把生成的 RDB 文件（或直接网络流）发送给 Slave。有两种传输方式：
+    R->>M: PSYNC ? -1（首次连接/无缓存）
+    M->>M: 检查：无匹配的 replid / offset 不在 backlog 中
 
-- **磁盘方式（`repl-diskless-sync no`，默认）**：Master 先把 RDB 写入磁盘，再从磁盘读出、发给 Slave。好处是不占用 Socket 缓冲区，坏处是磁盘 I/O 开销大。
-- **无盘方式（`repl-diskless-sync yes`）**：Master 直接在内存中生成 RDB，一边生成一边通过 Socket 发给 Slave——RDB 文件不落地。好处是没有磁盘 I/O，坏处是占用 Socket 发送缓冲区。
+    M->>R: +FULLRESYNC <new_replid> <offset>
+    Note over M: ⚠️ 关键：此时继续处理所有写入请求！
 
-**步骤五：Slave 加载 RDB**
+    M->>MF: fork() 创建子进程
+    MF->>MF: 生成 RDB 快照（COW 机制）
+    Note over M: 期间的写命令都进入 client-output-buffer
+    M->>M: 所有写入命令积压在 replication buffer复制缓存区 中
 
-Slave 收到 RDB 文件后，第一件事是**清空自己的所有旧数据**（相当于执行 FLUSHALL——但这是在 Slave 上，不影响 Master）。然后 Slave 把 RDB 文件加载到内存中。加载完成后，Slave 的数据和 Master 执行 BGSAVE 那一瞬间的数据完全一致。
+    MF->>MD: RDB 写入磁盘（或直接发网络——无盘复制）
+    MF-->>M: 子进程退出
 
-**步骤六：Slave 回放 replication buffer 中的增量命令**
+    M->>R: 发送 RDB 数据（可能分多次发送）
+    M->>R: 发送积压的 buffer 命令
 
-Master 把步骤三中缓存在 replication buffer 中的写命令全部发给 Slave。Slave 逐条执行这些命令。执行完后，Slave 的数据就和 Master 当前数据完全一致了——全量同步结束，进入命令传播阶段。
-
-### 3.3 增量同步——断线重连后的"只补差异"
-
-全量同步是这个过程中最昂贵的操作。每次全量同步 = Master 做一次 BGSAVE + 传输整个 RDB 文件。如果 Slave 只是短暂的网络抖动掉了线，重连后不应该再做全量同步——只发差异数据就够了。
-
-Redis 实现增量同步，依赖三个关键的量：
-
-**Replication ID（复制 ID）**
-
-每个 Master 在启动时生成一个全局唯一的 40 字符的随机 ID（Replication ID）。这个 ID 就是 Master 的"身份标识"。Slave 同步后会记住这个 ID——下次重连时把它发给 Master："我上次同步的 Master 是 ID=xxx，你是我之前认识的 Master 吗？"
-
-如果 Master 确认自己的 ID 和 Slave 提供的 ID 一致——说明 Slave 确实是从"我"这里同步过数据——那就有可能做增量同步。如果 ID 不一致——比如旧的 Master 宕机后 Slave 被提升为 Master，或者 Master 被重启了——那 ID 就变了→全量同步。
-
-**复制偏移量（Replication Offset）**
-
-Master 和 Slave 各自维护一个"复制偏移量"——一个从 0 开始递增的计数器。Master 每向 Slave 发送 N 个字节的复制命令，Master 的 offset 就加 N。Slave 每收到并执行 N 个字节的复制命令，Slave 的 offset 也加 N。
-
-正常情况下，Master 的 offset 和 Slave 的 offset 应该一致（或 Slave 略微落后，因为命令在传输过程中）。如果 Slave 掉线后重连，可以发现自己的 offset 比 Master 的 offset 小——意味着 Slave 缺了一部分数据。
-
-**repl-backlog-buffer（复制积压缓冲区）**
-
-这是增量同步的"保险"。`repl-backlog-buffer` 是 Master 端的一个固定大小的**环形缓冲区**。Master 向 Slave 发送复制命令时，不仅发给 Slave，同时也写到这个缓冲区中。
-
-这个缓冲区的设计思想是："Master 记住最近发送出去的数据"。当 Slave 掉线后重连，告诉 Master 自己的偏移量。Master 检查这个偏移量是否在 backlog buffer 的范围内——在的话，直接从那个偏移量处开始把缺失的部分发给 Slave（增量同步）；不在的话，只能做全量同步。
-
-```
-repl-backlog-buffer 的运作图：
-
-  ┌─────────────────────────────────────────────────────────────┐
-  │ backlog buffer（环形，大小 = repl-backlog-size）             │
-  │                                                             │
-  │ [off=100] [off=101] [off=102] ... [off=500] [off=501] ... │
-  │     ↑                                  ↑         ↑         │
-  │   已覆盖                          Slave断线前  Master最新    │
-  │   (最早能提供                     的位置       offset       │
-  │    的偏移量=100)                                           │
-  │                                                             │
-  │ Slave 断线前的 offset = 500，重连后的 offset = 500         │
-  │ Master 最新 offset = 550                                    │
-  │ 500 在 [100, 550] 范围内 → 增量同步！                       │
-  │                                                             │
-  │ 但如果 Slave 重连时偏移量 = 80（太老，已被缓冲区覆盖）       │
-  │ → 只能全量同步！                                            │
-  └─────────────────────────────────────────────────────────────┘
+    R->>R: 清空自身所有旧数据（FLUSHALL 语义）
+    R->>R: 加载 RDB 到内存
+    R->>R: 回放 buffer 中的增量命令
+    Note over R: 此时 replica 数据追平了 fork 时刻 + buffer 期间的所有写入
 ```
 
-**`repl-backlog-size` 这个值怎么设定？**
+#### 3.2.2 全量复制期间的三大核心问题
 
-这是生产中非常容易踩的坑。默认的 `repl-backlog-size` 是 1MB——小得离谱。在写密集的场景下，Master 每秒产生几 MB 的复制数据，1MB 的缓冲区只能覆盖几百毫秒内的数据。这意味着 Slave 只要掉线超过几百毫秒，重连后就只能做全量同步。
+**问题1：fork 子进程时，master 能继续处理写请求吗？**
 
-生产建议：
-- 中等写入量（几千 QPS）：设置为 64MB
-- 高写入量（几万 QPS）：设置为 256MB
-- 极端写入量：512MB 或更大
+> **能。** 这得益于操作系统的 **COW（Copy-On-Write，写时复制）** 机制。
+>
+> ```
+> fork() 的工作原理（精简版）：
+>
+>   父进程页表                      物理内存                子进程页表
+>   ┌──────────┐                ┌──────────────┐        ┌──────────┐
+>   │ Page 0 R │───────────────▶│  真实数据页   │◀───────│ Page 0 R │
+>   │ Page 1 R │──┐             └──────────────┘    ┌───│ Page 1 R │
+>   │ Page 2 R │  │                                 │   │ Page 2 R │
+>   └──────────┘  │                                 │   └──────────┘
+>                 │            ┌──────────────┐     │
+>                 └───────────▶│  真实数据页   │◀────┘
+>                              └──────────────┘
+>
+>   fork 之后：
+>   - 父子进程共享同一块物理内存，页表都标记为只读（R）
+>   - 不复制任何数据！fork() 的速度和内存大小无关
+>
+>   父进程（master）执行写入时：
+>   ┌──────────┐                ┌──────────────┐        ┌──────────┐
+>   │ Page 0 R │───X            │  原始数据页   │◀───────│ Page 0 R │
+>   │ Page 1 W │───┐            └──────────────┘        │          │
+>   │          │   │                                    │          │
+>   └──────────┘   │     ┌──────────────┐              └──────────┘
+>                  └────▶│  新数据页(COPY)│
+>                        └──────────────┘
+>   - 触发「页故障」(page fault)，操作系统拷贝一个新页给父进程
+>   - 子进程仍然指向原始页，不受影响
+>   - COW 的代价 = 被修改的页数 × 4KB（一页），而不是整个数据量
+> ```
+>
+> **所以，master 在 fork 期间和 fork 之后都能正常处理请求。**
+> 但要注意两个风险：
+> 1. fork 操作本身是瞬时阻塞的（调用 fork() 的一瞬间），数据量大时这个瞬间可能较长
+> 2. 如果写操作太密集，COW 复制很多页，内存会膨胀
 
-一个经验公式：`repl-backlog-size = 复制数据流速(MB/s) × 预期最长断线时间(秒)`
+**问题2：如果 RDB 文件很大（如 20GB），会有什么问题？**
 
-例如 Master 每秒产生 5MB 复制数据，你预期 Slave 最多断线 60 秒——`repl-backlog-size = 5 × 60 = 300MB`。
+> | 阶段 | 问题 | 后果 |
+> |------|------|------|
+> | **fork** | 大内存实例 fork 耗时可达数百毫秒，期间 master 阻塞 | 请求延迟尖刺 |
+> | **RDB 生成** | 子进程写 RDB 消耗磁盘 I/O | 影响 master 的 AOF/RDB 持久化 I/O |
+> | **RDB 传输** | 20GB 文件跨网络传输，耗时可能 >= 10 分钟 | 带宽打满影响其他服务 |
+> | **replication buffer** | 传输期间的大量写入可能撑爆 buffer | 复制中断，重新开始（死循环）|
+> | **replica 加载 RDB** | replica 清空数据 + 加载 20GB 耗时数分钟 | replica 在此期间不可服务 |
+>
+> **解决方案：**
+> - 无盘复制（`repl-diskless-sync`）：RDB 不落盘，直接通过网络发送:rocket::rocket::rocket::rocket:
+> - 级联复制：不要让所有 replica 都从 master 全量同步:rocket::rocket::rocket::rocket:
+> - 拆分大实例：一个 20GB 的实例拆成多个小实例
 
-**如果 backlog 不够大，会导致什么？**
+**问题3：`client-output-buffer-limit slave` 的机制**:rocket::rocket::rocket::rocket::rocket::rocket:
 
-Slave 短暂断连 → 重连 → offset 不在 backlog 范围内 → 触发全量同步。每次全量同步 = Master fork + BGSAVE + 传输整个 RDB。如果频繁发生——比如机房网络不稳定导致 Slave 频繁抖动掉线——就是大量的全量同步 → CPU、网络、磁盘全面冲击 → 整个集群被拖垮。**这就是为什么 backlog size 太小会放大集群不稳定性。**
+`client-output-buffer-limit slave` 是 Redis 主节点上专门用来控制**主从复制缓冲区**大小的一项关键配置。它的核心作用是：**防止主节点因为从节点同步太慢而被撑爆内存**。
 
----
+当 Redis 实例作为**主节点**时，每个连接到它的从节点，在主节点内部都会有一个**输出缓冲区（output buffer）**。主节点会把所有写命令写入这个缓冲区，然后通过网络发给从节点。
 
-## 第四章：命令传播阶段——主从之间的持续数据流
+如果从节点因为机器性能差、网络延迟高、加载 RDB 文件慢等原因处理不过来，主节点的这个缓冲区就会越来越大，无限制增长的话会耗尽主节点内存，导致主节点 OOM 崩溃。
 
-完成数据同步后，主从进入"命令传播"阶段——这是复制链路的长常态。
+`client-output-buffer-limit slave` 就是用来限制这个缓冲区的大小的。超过限制，主节点会**主动断开这个从节点的复制连接**，保护自己。
 
-### 4.1 命令传播的工作原理
+```c
+// 源码配置结构
+// client-output-buffer-limit <class> <hard_limit> <soft_limit> <soft_seconds>
+//
+// 默认值：client-output-buffer-limit slave 256mb 64mb 60
 
-Master 的写命令处理器中有这样一段逻辑：每成功执行一条写命令，就检查"是否有 Slave 连着"。有的话，就把这条命令（以 RESP 协议编码）写入每个 Slave 的复制缓冲区，同时把这条命令的数据追加到 `repl-backlog-buffer`，然后更新 Master 的 offset。这一切发生在执行完命令后、返回客户端之前——对 Master 的性能几乎没有影响。
+// 含义：
+// hard_limit = 256MB：超过这个值，立即断开连接
+// soft_limit = 64MB：超过这个值，开始计时
+// soft_seconds = 60：连续超过 soft_limit 60 秒，断开连接
 
-Slave 收到复制命令后，和普通命令一样执行——解析 RESP、执行命令、修改自己的内存数据——唯一的区别是 Slave 处理的"伪客户端"不需要做权限校验（因为 Master 已经校验过了）。
-
-### 4.2 心跳维持
-
-在命令传播阶段，主从之间是"长连接"——一条 TCP 连接维持几个甚至几个月。为了确认连接还活着，双方定期发送心跳：
-
-**Master → Slave：PING**
-
-Master 默认每 10 秒向 Slave 发送一次 PING（由 `repl-ping-replica-period` 控制）。这不是为了检查 Slave 是否还活着（TCP 保活机制已经能检查），而是为了**维持 TCP 连接**——防止长时间无数据传输，中间的网络设备（如防火墙、负载均衡器）把空闲连接断开。同时如果 Slave 没有在规定时间内回复 PONG，Master 就知道 Slave 出现了问题。
-
-**Slave → Master：REPLCONF ACK**
-
-Slave 默认每 1 秒向 Master 发送一次 `REPLCONF ACK <当前offset>`。这个心跳消息有两个作用：① 告诉 Master"我还活着，我的 offset 是 xxx"；② 让 Master 知道 Slave 的复制进度。
-
-Master 通过 ACK 中的 offset 判断 Slave 的延迟。如果某个 Slave 的 offset 和 Master 差距很大——说明 Slave 的处理速度跟不上 Master 的写入速度。如果连续检测到 Slave 延迟过大，可能需要排查 Slave 机器是否有性能问题。
-
-### 4.3 复制偏移量的三个作用
-
-复制偏移量不只是"数据一致性的度量"，它在 Redis 中有三个关键的用途：
-
-**用途一：增量同步判断** —— Slave 重连时发送自己的 offset，Master 判断是否在 backlog 内。
-
-**用途二：Sentinel 选主排序** —— Sentinel 故障转移时，多个 Slave 抢着当新 Master。谁的 offset 大（数据越新），谁当选的概率就越高。这保证了"数据最完整的 Slave 成为新 Master"。
-
-**用途三：`min-replicas-to-write` 安全保障** —— Master 写数据时，检查"有多少 Slave 的 offset 和我的 offset 差距在可接受范围内"。达不到最少 Slave 数——Master 拒绝写入——用"牺牲可用性"换"数据安全性"。
-
----
-
-## 第五章：主从延迟——读写分离的"隐形杀手"
-
-### 5.1 主从延迟是怎么产生的？
-
-即使是最理想的环境下（同机房、万兆网络、Slave 机器性能足够），主从延迟也是客观存在的。Master 写入数据到 Slave 收到并执行，中间的延迟包括：
-
-- **Master 处理时间**：写命令执行完成到写入复制缓冲区的耗时（微秒级，可忽略）
-- **网络传输时间**：从 Master 发送数据到 Slave 接收数据（同机房 0.1-0.5ms，跨机房 1-5ms）
-- **Slave 处理时间**：Slave 收到命令、解析、执行的耗时（微秒级，和 Master 执行命令差不多）
-
-正常情况下的主从延迟大约 0.5-2ms。但在以下场景中，延迟可能飙升至秒级甚至几十秒：
-
-- **Master 瞬时大量写入**：比如 1 秒内 5 万次 SET → Master 要发 5 万条命令给 Slave → Slave 处理不过来 → 积压
-- **Slave 处理能力不足**：Slave 的 CPU/内存不如 Master → 执行跟不上发送速度
-- **网络带宽瓶颈**：复制流量占满网卡 → 新命令发不过去 → 延迟飙升
-- **BigKey 写入**：Master 执行 `SET bigkey 10MB数据` → Master 正常写入 → Slave 执行时 10MB 的 SDS 分配更慢（因为 Slave 机器配置可能更低）
-
-### 5.2 主从延迟会引发的具体问题
-
-**问题一：刚写入的数据读不到**
-
-这是读写分离最常见的投诉。用户提交了一个订单——`SET order:12345 ...` 写入 Master → 页面自动跳转到订单详情页 → 代码从 Slave 读取 `GET order:12345` → Slave 还没收到这个 key → 返回 nil → 页面显示"订单不存在"。用户刷新一下，请求路由到另一个 Slave（这个 Slave 已经收到了）→ 订单出现了。用户：你们的系统不稳定吧？
-
-**问题二：分布式锁在主从切换时丢失**
-
-这是 Redis 分布式锁最大的"坑"。Client-A 在 Master 上拿到了锁 `SET lock:order NX PX 30000` → Master 还没来得及把这条命令同步给 Slave → Master 宕机 → Sentinel 提升 Slave 为新 Master → Client-B 在新 Master 上拿锁 `SET lock:order NX PX 30000` → 锁根本不存在（因为旧 Master 的锁没同步过来！）→ Client-B 也拿到了锁 → A 和 B 同时执行业务 → 并发安全崩了。这就是为什么 RedLock 和 ZooKeeper 存在的原因——普通 Redis 主从复制的锁不是绝对安全的。
-
-### 5.3 业务层面如何应对主从延迟
-
-对于问题一（刚写读不到），业务代码可以标记"哪些请求刚执行了写操作"，对于这些请求，强制从 Master 读取，避免延迟问题：
-
-```java
-/**
- * 读写分离 + 写后一致性策略
- * 
- * 设计思路：
- *   1. 维护一个 ThreadLocal 标记"当前请求是否刚刚执行了写操作"
- *   2. 写操作执行后设置标记为 true
- *   3. 读操作读之前检查标记 → true 则走 Master → false 则走 Slave（正常分流）
- *   4. 请求处理完成后清除标记
- * 
- * 这种策略覆盖了绝大部分"写入 → 马上查询"的业务场景：
- *   下订单 → 查看订单详情
- *   修改个人信息 → 刷新个人主页
- *   发布内容 → 查看发布的内容
- */
-@Service
-public class ReadAfterWriteService {
-
-    private final ThreadLocal<Boolean> wroteInCurrentRequest = 
-        ThreadLocal.withInitial(() -> false);
-
-    /**
-     * 写操作——标记"刚刚写过"
-     */
-    public void saveProduct(String productId, Map<String, String> data) {
-        // 写 Master（正常）
-        redissonClient.getMap("product:" + productId).putAll(data);
-        // 标记：当前请求刚写过数据
-        wroteInCurrentRequest.set(true);
+// 判断逻辑（源码精简）：
+int checkClientOutputBufferLimits(client *c) {
+    unsigned long used = getClientOutputBufferMemoryUsage(c);
+    if (used > hard_limit) {
+        // 超过硬限制 → 立即断开
+        freeClient(c);
+        return 1;
     }
-
-    /**
-     * 读操作——如果刚写过，强制读 Master
-     */
-    public Map<String, String> getProduct(String productId) {
-        RMap<String, String> product;
-
-        if (wroteInCurrentRequest.get()) {
-            // 当前请求刚写过数据 → 强制从 Master 读
-            // 避免主从延迟导致"读不到刚写的数据"
-            product = redissonClient.getMap("product:" + productId);
-            // 读取完成后重置标记
-            wroteInCurrentRequest.remove();
-        } else {
-            // 正常请求 → 走 Slave（由 Redisson 自动路由）
-            product = redissonClient.getMap("product:" + productId);
+    if (used > soft_limit) {
+        // 超过软限制 → 开始计时
+        if (c->obuf_soft_limit_reached_time == 0) {
+            c->obuf_soft_limit_reached_time = server.unixtime;
+        } else if (server.unixtime - c->obuf_soft_limit_reached_time > soft_seconds) {
+            // 持续时间超过 60 秒 → 断开
+            freeClient(c);
+            return 1;
         }
-        return product.readAllMap();
+    } else {
+        // 降到软限制以下 → 重置计时器
+        c->obuf_soft_limit_reached_time = 0;
+    }
+    return 0;
+}
+```
+
+**调优公式：**
+
+```
+buffer 容量的基本公式：
+  buffer_size ≥ (RDB 传输时间 + RDB 加载时间) × 写入速率
+
+实例：
+  RDB 大小 = 10GB
+  网络带宽 = 1Gbps → 理论传输时间 ≈ 80 秒
+  写入速率 = 10MB/s
+  → buffer 需求 ≥ 80s × 10MB/s = 800MB
+
+  所以默认的 256MB 硬限制在 RDB 较大时很可能不够！
+```
+
+---
+
+### 3.3 部分复制（Partial Resynchronization）
+
+#### 3.3.1 为什么需要部分复制？
+
+```
+场景：replica 和 master 网络闪断了几秒钟
+  - 如果用全量复制：重新 fork + 生成 RDB + 传输 + 加载
+    → 10GB 实例：几分钟的代价，期间 master CPU/内存/网络都受冲击
+
+  - 如果用部分复制：master 把断线期间的增量命令直接发给 replica
+    → 可能只有几百 KB，瞬间完成
+
+这就是 PSYNC 的价值：让「短暂断线」≠「全量复制」
+```
+
+### 全量同步的笨办法
+
+- 主库 = 老师，从库 = 学生抄笔记。
+- 老方式（`SYNC`）：学生哪怕只走神了 1 秒，老师也必须把整本笔记（RDB 快照）从头到尾重新念一遍，效率极低。
+
+------
+
+### 部分重同步怎么工作？
+
+老师（主库）想了个办法：
+
+- 他有一个 **录音机（replication backlog）**，会录下自己讲过的每一句话（写命令），并给每句话编上序号（offset）。
+- 学生（从库）走神回来，只要说：“老师，我最后听到的是第 **1000** 号指令。”
+- 老师检查录音机，发现从 1000 号之后的录音都还在（因为录音机容量有限，太旧的可能被覆盖），于是直接播放 **1001 号、1002 号……一直到当前最新** 的录音。:rocket::rocket::rocket::rocket::rocket:
+- 学生补上这些笔记后，继续听老师讲新课（实时复制流）。
+
+**注意：“缺失的数据”正是这 1001 号到当前最新之间的录音，补完之后，后面的新课（后续命令）学生自然会继续听，不会漏掉。**
+
+### 回到 Redis 的实际流程:rocket:
+
+从库断线重连后，发送 `PSYNC <run_id> <offset>`：
+
+- `offset` 是从库已经收到的最后一个命令的偏移量。
+- 主库检查自己的 **复制积压缓冲区（replication backlog）**：
+  - 如果 `offset` 还在缓冲区内，主库就把 **offset+1 一直到当前最新** 的所有命令打包发给从库。
+  - 从库按顺序执行这些命令，状态追上主库。
+- 之后，主库产生的每一个新写命令，依然会**实时**发送给从库。
+
+#### 3.3.2 三大核心数据结构
+
+```mermaid
+graph TB
+    subgraph Master
+        REPLID[replicationID<br/>主库唯一标识<br/>格式: 40字节随机hex字符串]
+        OFFSET_M[Master Offset<br/>累计写入字节数<br/>每写一个字节 +1]
+        BACKLOG[Replication Backlog<br/>环形缓冲区<br/>默认 1MB<br/>存储最近的写入命令]
+    end
+
+    subgraph Replica
+        REPLID2[复制的 Master replid<br/>记录上次同步的 master 是谁]
+        OFFSET_R[Replica Offset<br/>当前已同步到的位置]
+    end
+
+    REPLID ---|"主库生成<br/>主库重启后变化"|REPLID
+    OFFSET_M ---|"全局递增<br/>每个写命令都更新"|OFFSET_M
+    BACKLOG ---|"环形覆盖<br/>新数据覆盖旧数据"|BACKLOG
+    OFFSET_R ---|"上报给 master<br/>REPLCONF ACK offset"|OFFSET_R
+```
+
+**replication backlog 源码结构：**
+
+```c
+// replication.c 中 backlog 的核心实现
+struct redisServer {
+    // ...
+    char *repl_backlog;       // 环形缓冲区的起始指针
+    long long repl_backlog_size;   // 缓冲区总大小（字节）
+    long long repl_backlog_histlen; // 当前已使用的大小
+    long long repl_backlog_idx;    // 下一个写入位置（环形指针）
+    long long repl_backlog_off;    // 缓冲区中最老数据的 offset（全局offset）
+    // ...
+};
+
+// 写入 backlog（每次执行写命令后调用）
+void feedReplicationBacklog(void *ptr, size_t len) {
+    // 如果 buffer 满了，需要环形覆盖
+    while (len > 0) {
+        size_t thislen = min(len, server.repl_backlog_size - server.repl_backlog_idx);
+        memcpy(server.repl_backlog + server.repl_backlog_idx, ptr, thislen);
+        server.repl_backlog_idx = (server.repl_backlog_idx + thislen)
+                                  % server.repl_backlog_size;
+        server.repl_backlog_histlen += thislen;
+        server.repl_backlog_off += thislen;
+        ptr = (char*)ptr + thislen;
+        len -= thislen;
+    }
+}
+
+// 判断是否可以部分复制
+int canPartialResync(long long replica_offset) {
+    // replica 请求的 offset 必须在 backlog 范围内
+    // backlog 中最老数据的 offset < replica_offset
+    if (replica_offset >= server.repl_backlog_off &&
+        replica_offset < server.repl_backlog_off + server.repl_backlog_histlen)
+    {
+        return 1;  // 可以部分复制！
+    }
+    return 0;  // 数据已被覆盖 → 只能全量复制
+}
+```
+
+#### 3.3.3 部分复制交互流程
+
+```mermaid
+sequenceDiagram
+    participant R as Replica<br/>(replid: abc, offset: 1000)
+    participant M as Master<br/>(replid: abc, offset: 5000)
+
+    Note over R,M: Replica 网络断开了 30 秒
+
+    Note over M: 期间 master offset 从 1000 涨到 5000<br/>backlog 缓存了 [1000, 5000] 这 4000 字节的数据
+
+    R->>M: 重连 → PSYNC abc 1000
+    M->>M: 校验 ① replid 匹配 ✓<br/>校验 ② 1000 在 backlog 范围内 ✓<br/>backlog 覆盖范围: [0, 5000]
+
+    M->>R: +CONTINUE
+    M->>R: 发送 backlog[1000..5000] 的增量数据
+
+    R->>R: 回放增量命令<br/>offset 追到 5000
+    Note over R,M: 部分复制完成，进入命令传播阶段
+```
+
+#### 3.3.4 部分复制退化为全量复制的场景
+
+| 场景 | 原因 | 预防措施 |
+|------|------|---------|
+| **断线时间太长** | replica 请求的 offset 已被 backlog 覆盖掉 | `repl-backlog-size` 调大 = 断线时长 × 写入速率 × 2 |
+| **Master 重启** | replid 变化，replica 的旧 replid 无法匹配 | 使用哨兵/cluster 做故障转移，避免直接重启主库 |
+| **Replica 重启**（无持久化） | replica 丢失了缓存的 replid 和 offset | replica 也开启 AOF/RDB 持久化 |
+| **主从切换** | 新 master 的 replid 变化 | PSYNC2（Redis 4.0+）通过 `replid2` 缓存旧主 replid |
+
+**backlog 大小计算公式：**
+
+```
+需求分析：
+  假设断线可能持续 T 秒，每秒写入 W 字节
+
+  backlog_size ≥ T × W × 2
+                ↑      ↑
+                │      └─── 安全系数（应对突发流量）
+                └── 断线窗口内的总写入量
+
+实例：
+  T = 60 秒（假设最坏情况断线 1 分钟）
+  W = 1MB/s（10000 writes/s × 100 bytes/write）
+  → backlog ≥ 60 × 1MB × 2 = 120MB
+
+默认 1MB 对于绝大多数场景都太小！
+生产环境建议：根据 INFO replication 中的 offset 增长速度来测算，设置为 10MB ~ 256MB
+```
+
+---
+
+### 3.4 命令传播阶段——进入稳态
+
+```
+命令传播伪代码（replication.c - propagateNow() / replicationFeedSlaves()）：
+
+void propagateNow() {
+    // ① 写入 AOF 文件（如果开启了 AOF）
+    if (server.aof_state != AOF_OFF)
+        feedAppendOnlyFile(cmd, dbid, argv, argc);
+
+    // ② 写入所有 replica 的输出缓冲区
+    replicationFeedSlaves(server.slaves, dbid, argv, argc);
+}
+
+void replicationFeedSlaves(list *slaves, int dictid, robj **argv, int argc) {
+    // ③ 先写入 backlog（为部分复制做准备）
+    if (server.repl_backlog) {
+        feedReplicationBacklog(buf, len);      // 写入环形缓冲区
+    }
+
+    // ④ 遍历所有 replica，异步发送命令
+    listRewind(slaves, &li);
+    while ((ln = listNext(&li))) {
+        client *slave = ln->value;
+        addReply(slave, buf, len);             // 写入 replica 的 output buffer
+        // 注意：这是异步的！addReply 只是把数据放到缓冲区，
+        // 真正的网络发送由 epoll 事件循环在下一次 loop 中处理
     }
 }
 ```
 
-### 5.4 Master 端的数据安全保障
+**关键结论：**
+
+> **异步复制 = 最终一致性。** Master 执行完写命令后，不会等待 replica 确认就返回客户端。这意味着：
+> 1. 客户端收到 OK 后，replica 可能还没收到这条命令
+> 2. Master 宕机时，未传播到 replica 的命令会丢失
+> 3. 这是 Redis 的设计选择——用一致性换性能
+
+---
+
+### 3.5 心跳与连接维护
+
+```mermaid
+sequenceDiagram
+    participant R as Replica
+    participant M as Master
+
+    loop 每秒一次
+        R->>M: REPLCONF ACK <replica_current_offset>
+        M->>M: 记录 replica 上报的 offset
+        M->>M: 更新 replica->repl_ack_off = replica_offset
+        M->>M: 更新 replica->repl_ack_time = now
+    end
+
+    loop Master 侧
+        Note over M: 检查：now - repl_ack_time > repl_timeout ?
+        Note over M: 若是 → 断开连接，认为 replica 已失联
+    end
+
+    loop 每 10 秒（provisional）
+        M->>R: PING
+        Note over R,M: master 也向 replica 发心跳，双向 keepalive保持连接
+    end
+```
+
+**心跳的三大作用：**
+
+| 作用 | 说明 |
+|------|------|
+| **① 检测连接状态** | timeout 未收到 ACK → 断开，避免半死连接 |
+| **② 上报 offset**:rocket::rocket::rocket::rocket::rocket::rocket::rocket: | master 用 `repl_ack_off` 判断 replica 追到哪里了（`INFO replication` 里的 `lag`） |
+| **③ 辅助 min-replicas** | `min-replicas-to-write` 依赖心跳时序来判断 "多少 replica 在线" 和 "延迟多大":rocket: |
+
+#### 深入追问：`min-replicas-to-write` 能保证强一致性吗？
+
+假设你有 **1 主 2 从 + 哨兵** 的 Redis 架构：:rocket::rocket::rocket::rocket::rocket::rocket:
+
+1. 客户端执行 `SET key "important"`。
+2. 主节点执行成功，**立即返回 OK 给客户端**。
+3. 主节点把这个写命令**异步**发送给从节点，但还没来得及发，**主节点的服务器突然断电烧毁**。
+4. 哨兵检测到主节点挂了，从剩余从节点中选出 **一个作为新主**。
+5. 客户端连上新主，执行 `GET key` → 返回 `nil`。
+
+**这条数据就永久丢了。**
+
+`min-replicas-to-write` 是 Redis 主节点上的一项**数据安全配置**，它让主节点在**从节点数量不足**时直接拒绝写请求，从而避免主节点宕机后数据丢失。
+
+默认的主从复制是**异步**的：主节点执行完写命令后，不等从节点确认就返回客户端。
+如果主节点突然宕机，而数据还没来得及复制到从节点，这部分数据就会永久丢失（即使哨兵做了故障切换）。
+
+`min-replicas-to-write` 提供了一种**弱一致性保证**：
+**“只有当足够多的从节点‘健康’时，主节点才接受写操作”。**
+
+```
+配置：
+  min-replicas-to-write 3
+  min-replicas-max-lag 10
+
+语义：
+  只有当 >= 3 个 replica 的 lag（延迟）<= 10 秒时，master 才接受写请求。
+  如果健康 replica 不足 3 个，master 拒绝写请求并返回错误。
+
+为什么不能保证强一致性？
+
+  假设时间线：
+  T0: 3 个 replica 都健康，lag < 10s → master 接受写入
+  T1: master 执行 SET key "value"，返回 OK 给客户端
+  T2: master 还没来得及把这条命令发给 replica
+  T3: master 突然宕机了！
+
+  结果：客户端认为写成功了，但 replica 上根本没有这条数据。
+       min-replicas 机制只是用「历史 lag」来推断，并不能保证毫秒级的实时同步。
+
+  真正的强一致性需要：
+  - 同步复制（master 必须等至少 N 个 replica 确认后才返回）
+  - 或者 Raft/Paxos 等共识协议
+  - Redis Cluster + WAIT 命令可以接近同步确认，但仍不是严格的 CP 保证
+
+面试话术：
+  "Redis 主从复制是异步复制，即使配置了 min-replicas-to-write，
+   也只能保证'至少有 N 个 replica 在过去 10 秒内是存活的'，
+   而不是'至少有 N 个 replica 已经确认收到了这条写命令'。
+   本质上是 AP 的，不是 CP 的。"
+```
+
+#### 深入追问：`repl-timeout` 设为多大合适？
+
+| 设置 | 问题 |
+|------|------|
+| **太小（如 5s）** | 正常的网络抖动就会被判定为超时 → 频繁断开重连 → 频繁全量/部分复制 |
+| **太大（如 600s）** | replica 已经"假死"很久了，master 还认为它在线 → `min-replicas` 判断失效 → 假死 replica 过期数据被读到 |
+| **推荐：内网 30~60s** | 内网 RTT < 1ms，30 秒足以排除真正的故障 |
+
+---
+
+## 第四章：关键配置参数深度解析
+
+| 参数 | 默认值 | 源码位置 | 含义 | 调优建议 |
+|------|--------|---------|------|----------|
+| `repl-backlog-size` | 1MB | `server.repl_backlog_size` | 部分复制的环形缓冲区大小:rocket::rocket::rocket: | **生产必调！** 根据写入速率 × 预估断线时长 × 2 计算，建议 64MB~256MB |
+| `repl-backlog-ttl` | 3600s | `server.repl_backlog_time_limit` | 所有 replica 断开后，backlog 保留多久才释放内存 | 减小无用内存占用，不需要调 |
+| `repl-timeout` | 60s | `server.repl_timeout` | 复制超时，包括同步阶段的超时和数据传输的超时 | 内网 30~60s，跨机房 120s |
+| `client-output-buffer-limit slave` | 256mb/64mb/60 | 见 `checkClientOutputBufferLimits()` | replica 输出缓冲区：硬限制/软限制/软限制时间 | RDB > 5GB 的生产环境，建议硬限制调到 512MB+ |
+| `replica-read-only` | yes | `server.repl_slave_ro` | 从库是否只读 | **不要改**。除非你做特殊的数据预处理管线 |
+| `min-replicas-to-write` | 0 | `server.repl_min_slaves_to_write` | 最少健康 replica 数（不满足则拒绝写入） | 高可用场景设为 >= 1，配合 `min-replicas-max-lag` |
+| `min-replicas-max-lag` | 10s | `server.repl_min_slaves_max_lag` | replica lag 超过此值视为不健康 | 根据业务 SLA 调整，5~30s |
+| `repl-diskless-sync` | no | `server.repl_diskless_sync` | 无盘复制：RDB 不写磁盘直接发网络 | 磁盘慢/网络快的场景开启，减少磁盘 I/O |
+| `repl-diskless-sync-delay` | 5s | `server.repl_diskless_sync_delay` | 等 N 秒，让更多 replica 排队一起做无盘同步 | 防止多个 replica 同时触发 fork |
+| `replica-serve-stale-data` | yes | `server.repl_serve_stale_data` | replica 与 master 失联后是否继续服务读请求 | 见 6.5 节详细分析 |
+| `repl-ping-replica-period` | 10s | `server.repl_ping_slave_period` | master 向 replica 发 PING 的间隔 | 配合 repl-timeout 设置，一般不需调整 |
+| `repl-diskless-load` | disabled | `server.repl_diskless_load` | replica 边接收 RDB 边加载（无盘加载） | 大 RDB 场景可减少加载时间 |
+
+---
+
+## 第五章：常见问题与事故排查
+
+### 5.1 从库延迟越来越大（复制延迟）
+
+**问题场景：**
+```
+$ redis-cli -p 6379 INFO replication
+# Master
+master_repl_offset:1234567890
+
+$ redis-cli -p 6380 INFO replication
+# Replica
+slave_repl_offset:1234000000
+
+# → 差距 = 567890 字节，而且越来越大
+```
+
+**根因分析：**:rocket::rocket::rocket::rocket::rocket::rocket:
+
+```
+Replica 只有一个命令处理线程！它的工作包括：
+  1. 处理来自 master 的复制命令（需要执行 SET/DEL 等操作）
+  2. 处理来自客户端的读请求
+
+如果客户端读请求太多，复制命令的处理时间被挤压 → offset 追不上 master。
+
+这本质上是一个单线程的队列堆积问题：
+
+  Master:         Replica:
+  [写][写][写]    [读][读][读][ 复制命令 ][读][读][读]...
+     ↓                ↑                       ↑
+   写入 10MB/s      客户端 QPS 3w          复制命令在排队等待
+```
+
+**定位手段：**
 
 ```bash
-# redis.conf（Master 端）——用"宁可不可用，不能丢数据"的策略
-# 
-# 当以下两个条件同时满足时，Master 才能执行写操作：
-#   ① 可正常连接的 Slave 数量 ≥ 1
-#   ② 所有 Slave 的复制延迟 ≤ 10 秒
-# 
-# 如果条件不满足 → Master 拒绝写 → 客户端收到报错 → 触发告警
-# 
-# 为什么这么设计？
-#   与其让 Master 在"没有 Slave 兜底"的情况下继续写入数据，
-#   不如直接拒绝写入 → 触发业务告警 → 人工介入
-#   防止"Master 写入了一堆数据，但所有 Slave 都跟丢了"
-#   最后 Master 宕机 → 这些数据永久丢失
+# 1. 查看复制状态
+redis-cli INFO replication | grep -E "master_repl_offset|slave_repl_offset|lag"
 
-min-replicas-to-write 1           # 至少 1 个 Slave 连接正常
-min-replicas-max-lag 10           # 所有 Slave 的延迟 ≤ 10 秒
+# 2. 查看从库的瞬时 QPS
+redis-cli --stat   # 持续输出 QPS
+
+# 3. 采样查看从库在跑的慢命令
+redis-cli SLOWLOG GET 10
+
+# 4. 查看从库的 CPU 使用率和内存带宽
+```
+
+**解决方案：**
+
+1. **减小从库读压力**：把读请求分流到更多 replica:rocket::rocket:
+2. **增加从库机器性能**：更好的 CPU / 内存（Redis 主要瓶颈在职内存带宽）
+3. **使用客户端做二次路由**：客户端感知主从拓扑，将特定 replica 上延迟过高的请求路由到其他 replica
+
+---
+
+### 5.2 主库重启后所有从库全量复制——复制雪崩
+
+```
+事故时间线：
+
+T0: Master 正常运行，5 个 replica 连接在线
+    每个 replica 持有数据 ① all>
+
+T1: Master 进程崩溃（或运维执行了重启）
+
+T2: Master 重启，replid 变成新值 (原 replid = AAA → 新的 = BBB)
+
+T3: 5 个 replica 全部重新连接
+    → 发送 PSYNC AAA <offset>（带着旧的 replid）
+    → Master:"我不认识 AAA" → 返回 +FULLRESYNC
+
+T4: 5 个 replica 同时触发全量复制！
+    Master: fork × 5 次 → CPU 爆满
+            发送 5 份 RDB → 网络带宽打满
+            5 个 client-output-buffer → 内存爆满
+
+T5: ❌ Master 被压垮，整个 Redis 体系崩溃
+```
+
+```mermaid
+graph LR
+    M[Master 重启<br/>replid 变化] --> R1[Replica 1<br/>全量复制]
+    M --> R2[Replica 2<br/>全量复制]
+    M --> R3[Replica 3<br/>全量复制]
+    M --> R4[Replica 4<br/>全量复制]
+    M --> R5[Replica 5<br/>全量复制]
+
+    R1 -->|同时 fork| CPU[CPU 100%]
+    R2 -->|同时传 RDB| NET[网络打满]
+    R3 -->|同时 buffer| MEM[内存爆满]
+    R4 -->|连接打满| CONN[连接耗尽]
+    R5 -->|...| CRASH[Master 再次崩溃]
+```
+
+**解决方案：**
+
+1. **Redis 4.0+ PSYNC2**：RDB 文件中保存 replid（从 RDB 加载后，master 继承旧的 replid 作为 `replid2`），replica 连上来时可匹配
+2. **使用哨兵做故障转移**：不要直接重启主库，让哨兵把 replica 晋升为新 master（新 master 的 replid 不变）
+3. **级联复制拓扑**：不要让所有 replica 直连 master，减少同时全量复制的数量
+
+---
+
+### 5.3 全量复制反复失败——Buffer 死循环
+
+```mermaid
+sequenceDiagram
+    participant R as Replica
+    participant M as Master
+
+    Note over R,M: 第 1 次尝试
+    R->>M: PSYNC ? -1
+    M->>M: fork → 生成 RDB
+    Note over M: RDB 传输过程耗时 10 分钟<br/>期间写入了大量数据 → buffer 超 256MB
+    M--xR: ❌ 断开连接（超过 buffer 硬限制）
+
+    Note over R,M: 第 2 次尝试（自动重连）
+    R->>M: PSYNC ? -1
+    M->>M: fork 生成 RDB...（又是 10 分钟）
+    M--xR: ❌ 又超了！
+
+    Note over R,M: 无限重复 → 复制永远失败！
+```
+
+**解决方案：**
+1. **增大 buffer**：`client-output-buffer-limit slave 512mb 128mb 120`:rocket:
+2. **无盘复制**：`repl-diskless-sync yes`（RDB 直接流式发送，不写盘不等 IO）:rocket:
+3. **拆分实例**：把大实例拆成多个小实例（每个 5GB 以下）
+4. **写流量控制**：全量复制期间对写请求做限流（业务层面配合）
+
+---
+
+### 5.4 复制风暴——一个主库挂太多从库
+
+```mermaid
+graph TD
+    M[Master<br/>16 个 replica 直连]
+
+    M --> R1[Replica 1]
+    M --> R2[Replica 2]
+    M --> R3[Replica 3]
+    M --> R4[...]
+    M --> R5[Replica 16]
+
+    Note1[问题：一次全量复制<br/>带宽 = 16 × RDB 大小<br/>CPU = 16 次 fork<br/>内存 = 16 个 buffer]
+
+    style Note1 fill:#ff6b6b,color:#fff
+```
+
+**级联复制——树状拓扑：**:rocket:
+
+```mermaid
+graph TD
+    M[Master<br/>只带 3 个直接 replica]
+
+    M --> R1_1[Replica 1-1<br/>作为「中间层」]
+    M --> R1_2[Replica 1-2<br/>作为「中间层」]
+    M --> R2_1[Replica 2-1<br/>作为「中间层」]
+
+    R1_1 --> S1[Sub-Replica A]
+    R1_1 --> S2[Sub-Replica B]
+    R1_1 --> S3[Sub-Replica C]
+    R1_1 --> S4[Sub-Replica D]
+
+    R1_2 --> S5[Sub-Replica E]
+    R1_2 --> S6[Sub-Replica F]
+    R1_2 --> S7[Sub-Replica G]
+
+    R2_1 --> S8[Sub-Replica H]
+    R2_1 --> S9[Sub-Replica I]
+
+    Note1[好处：全量复制压力被分摊<br/>每个节点只负责 3~4 个子节点<br/>坏处：复制延迟叠加]
+
+    style Note1 fill:#51cf66,color:#fff
+```
+
+```
+级联复制配置：
+  # Master（6379）
+  # 中间 Replica（6380）
+  REPLICAOF 127.0.0.1 6379  # 从 Master 同步
+
+  # 叶子 Replica（6381）
+  REPLICAOF 127.0.0.1 6380  # 从中间 Replica 同步
+
+坏处：
+  - 延迟叠加：Master → 中间 → 叶子，数据到达叶子需要双重延迟
+  - 中间节点挂了 → 下面所有叶子断连
+  - INFO replication 在中间节点上，叶子 replica 显示 master 是中间节点
 ```
 
 ---
 
-## 第六章：replication buffer 和 repl-backlog-buffer —— 不要搞混
+## 第六章：深入专题
 
-这是面试中容易被混淆的两个概念。它们的目标完全不同：
+### 6.1 Redis 2.8 前后的复制演进
 
-| 维度 | replication buffer | repl-backlog-buffer |
-|------|-------------------|-------------------|
-| **归属** | 每个 Slave 独占一份 | Master 全局只有一份 |
-| **生命周期** | Slave 连接期间存在 | Master 启动后就存在 |
-| **内容** | 从全量同步开始到当前的所有增量 | 最近发出的复制数据 |
-| **作用** | 全量同步期间缓存增量命令 | 增量同步时提供差异数据 |
-| **大小** | 动态变化（无固定大小，受 client-output-buffer-limit 限制） | 固定大小（repl-backlog-size） |
-| **满了** | 超过限制 → Master 断开 Slave | 环形覆盖老数据 |
+```
+时间线：
 
-**为什么需要两个不同的缓冲区？**
+Redis 2.6 及之前：  SYNC
+  ┌─────────────────────────────────────┐
+  │ 每次重连 → 全量复制 → fork + RDB    │
+  │ 不管断线多久，哪怕只断了 0.1 秒      │
+  │ 问题：资源消耗巨大，毫秒级抖动引发    │
+  │       全量复制，闭环放大故障          │
+  └─────────────────────────────────────┘
 
-这个问题会暴露你对主从复制的理解深度。replication buffer 是为"全量同步期间"设计的——在 RDB 生成的几秒内暂存增量命令，发给 Slave 后就被清空。repl-backlog-buffer 是为"日常命令传播"设计的——持续记录 Master 发出的数据，以备未来 Slave 断线重连时做增量同步。
+Redis 2.8：         PSYNC
+  ┌─────────────────────────────────────┐
+  │ 引入 Replication ID + Offset +       │
+  │      Backlog 三大机制               │
+  │ 短暂断线 → 部分复制（增量同步）      │
+  │ 只发断线期间的增量命令               │
+  │ 问题：主库重启 → replid 变化          │
+  │       → 全部 replica 又全量复制       │
+  └─────────────────────────────────────┘
+
+Redis 4.0：         PSYNC2
+  ┌─────────────────────────────────────┐
+  │ 引入 replid2（备份复制ID）            │
+  │ 主库重启后：                          │
+  │   - 新的 replid = <新生成>           │
+  │   - 旧的 replid → 保存到 replid2    │
+  │ Replica 连接时：                      │
+  │   - 先尝试用旧 replid 匹配           │
+  │   - 如果 replid2 匹配 → 仍可部分复制  │
+  │ 解决了主库重启导致的全量复制雪崩       │
+  └─────────────────────────────────────┘
+```
+
+**PSYNC2 的核心改进（源码层面）：**
+
+```c
+// Redis 4.0+ 的 replid 模型
+struct redisServer {
+    char replid[CONFIG_RUN_ID_SIZE+1];   // 当前 replid（主库重启后重新生成）
+    char replid2[CONFIG_RUN_ID_SIZE+1];  // 前一个 replid（主库重启前的）
+    long long second_replid_offset;      // replid2 生效时的 offset
+};
+
+// replica 请求 PSYNC 时的匹配逻辑
+int masterTryPartialResynchronization(client *c, char *replid, long long psync_offset) {
+    // ① 先匹配当前 replid
+    if (strcasecmp(replid, server.replid) == 0) {
+        if (canPartialResync(psync_offset)) {
+            return PSYNC_CONTINUE;  // 正常部分复制
+        }
+    }
+
+    // ② 再匹配 replid2（PSYNC2 新增！）
+    if (strcasecmp(replid, server.replid2) == 0 &&
+        psync_offset >= server.second_replid_offset)
+    {
+        // 用旧 replid 找到匹配 → 从这个 offset 开始可以部分复制
+        // 这意味着主库重启后，replica 仍可部分复制！
+        return PSYNC_CONTINUE;
+    }
+
+    // ③ 都不匹配 → 只能全量复制
+    return PSYNC_FULLRESYNC;
+}
+```
+
+**面试追问：PSYNC2 能解决所有场景的主从切换吗？**
+
+> 不能。PSYNC2 只能解决「同一个主库重启」的场景（replid2 机制）。对于「哨兵选举 replica 成为新 master」，新 master 的 replid 是它自己的（不是旧 master 的），所以连接新 master 的其他 replica 仍可能触发全量复制——除非它们跟新 master 有同步过的历史关系。
 
 ---
 
-## ⭐️ 面试题汇总
+### 6.2 无盘复制（Diskless Replication）:rocket::rocket::rocket::rocket:
 
-**Q1: Redis 主从复制的完整流程是怎样的？分几个阶段？**
+```
+传统全量复制（有盘）：
+  Master: fork → 写 RDB 到磁盘 → 读 RDB 从磁盘 → 发网络
+  问题：磁盘 I/O 两次（写 + 读），慢 + 磁盘成为瓶颈
 
-> 三个阶段。① 建立连接（Slave REPLICAOF→Master 接受，PING/PONG 确认网络通畅，AUTH 认证）。② 数据同步（首次连接→全量同步=Master BGSAVE RDB 发给 Slave→Slave 清空旧数据+加载 RDB+回放 replication buffer 中的增量命令；断线重连→先尝试增量同步=PSYNC+offset 判断，在 backlog 内就发差异，不在就全量同步）。③ 命令传播（Master 每条写命令→发给所有 Slave→Slave 执行→回 ACK offset）。核心：两个缓冲区（replication buffer 为全量同步存增量，backlog buffer 为增量同步存历史）。
+无盘复制（Diskless）：
+  Master: fork → 子进程直接通过 socket 把 RDB 数据流式发给 replica
+  好处：跳过磁盘，速度取决于网络带宽
 
-**Q2: 全量同步和增量同步的区别？增量同步的条件是什么？**
+对比：
 
-> 全量同步需要 Master fork BGSAVE 生成 RDB→发送给 Slave→Slave 清空所有旧数据→加载 RDB，开销大。增量同步只需要把 Slave 缺失的部分数据发送过去，开销小。增量同步条件：① Slave 的 Replication ID == Master 自己的 ID；② Slave 的复制偏移量仍在 Master 的 repl-backlog-buffer 所覆盖的范围内。缺一个条件→全量同步。
+  有盘模式：
+  ┌─────┐      ┌──────┐      ┌──────┐
+  │fork │─→─磁盘│RDB 文件│─→─│ 发送  │
+  └─────┘      └──────┘      └──────┘
 
-**Q3: repl-backlog-buffer 设得太小会导致什么问题？**
+  无盘模式：
+  ┌─────┐      ┌──────────────┐
+  │fork │─→─直接│→ 网络 socket │
+  └─────┘      └──────────────┘
 
-> Slave 短暂断连后重连→缺失的数据已被 backlog 覆盖→无法增量同步→触发全量同步。每次全量同步=Master fork+BGSAVE+传输整个 RDB→CPU/网络/磁盘冲击。如果频繁发生（网络不稳定导致 Slave 频繁断连）→连续的全量同步几乎能把集群拖垮。生产建议至少 64-256MB。
+什么时候用无盘复制？
+  ✅ 磁盘慢（机械硬盘），网络快（万兆网卡）
+  ✅ 数据安全不关心（RDB 不落盘也没什么）
+  ❌ 磁盘快，网络慢（仍然是磁盘更快）
+  ❌ 需要 RDB 用于灾难恢复（无盘复制不产生 RDB 文件）
+```
 
-**Q4: 主从延迟会导致什么问题？业务怎么应对？**
+**`repl-diskless-sync-delay` 的作用：**
 
-> ① 读写分离下"刚写的数据读不到"——用户下订单后跳到订单详情页，页面显示"订单不存在"。解决：用 ThreadLocal 标记"当前请求刚写过数据"，后续读操作强制走 Master。② 分布式锁在主从切换时丢失——Master 的锁还没来得及同步给 Slave→Master 宕机→Slave 提升后没有锁信息→锁丢失。解决：RedLock/ZooKeeper/etcd。③ 配置 `min-replicas-to-write`+`min-replicas-max-lag` 保障数据安全。
+```
+场景：同时有 3 个 replica 发起全量复制
+
+如果不 delay：
+  Master: fork #1 → 发送 replica-1
+          fork #2 → 发送 replica-2    ← 三次 fork，内存三份 COW
+          fork #3 → 发送 replica-3
+
+如果有 delay（5秒）：
+  replica-1 触发全量复制 → master 等 5 秒
+  replica-2 在这 5 秒内到达 → 加入"等待队列"
+  replica-3 也在这 5 秒内到达 → 加入"等待队列"
+  5 秒到期 → 一次 fork，同时发给 3 个 replica！
+
+好处：只有一次 fork，一次 COW，内存压力大大降低
+```
 
 ---
 
-*Created: 2026-05-26 | Category: 19-Redis高可用-主从复制*
+### 6.3 从库如何删除过期键？
+
+```
+核心原则：Master 说了算。
+
+1. 主库删除一个过期 key → 向 replica 发送 DEL <key>
+2. Replica 不会主动删除过期 key（即使 TTL 已到）
+3. Replica 在读取时发现 key 已过期 → 不返回该 key
+   （但不主动删除！等 master 发 DEL）
+
+为什么这样设计？
+  目的：保持主从时钟不一致时的正确性。
+
+  假设 replica 主动删除：
+    主库时钟：T = 100，key 的 EXPIRE = 150，还未过期
+    从库时钟：T = 200（时钟快了 100 秒），key 的 EXPIRE = 150，"看起来"已经过期
+    从库删了这个 key → 主从数据不一致！
+
+  replica 不主动删除：
+    主库到 T = 150 时，删除 key，发 DEL 给 replica
+    replica 收到 DEL，删除 key
+    主从一致 ✅
+
+源码实现（expireIfNeeded）：
+  int expireIfNeeded(redisDb *db, robj *key) {
+      if (!keyIsExpired(db, key)) return 0;
+
+      // 如果当前是 replica → 只返回"过期了"，但不删除
+      if (server.masterhost != NULL) {
+          return 1;  // 返回 1 表示过期，但不调用 dbDelete
+      }
+
+      // Master 侧 → 正常删除 + 传播
+      dbDelete(db, key);
+      propagateExpire(db, key, server.lazyfree_lazy_expire);
+      return 1;
+  }
+```
+
+---
+
+### 6.4 为什么主从都要开启持久化？
+
+```
+事故场景：
+  1. Master 和 Replica 都关闭了持久化
+  2. Master 进程重启（运维误操作）
+  3. Master 重启后内存是空的
+  4. Replica 连上 Master → 发起全量复制
+  5. Replica 清空自己的数据，从 Master 同步空数据
+  6. 结果：所有数据永久丢失！
+
+即使 Replica 有持久化而 Master 没有：
+  - Master 重启 → 内存空
+  - Replica 全量复制 → 清空数据 → 数据也丢了
+
+所以：
+  主库持久化：防止重启后数据丢失，影响所有 replica
+  从库持久化：至少有一个包含完整数据的 RDB/AOF 副本
+             → 即使全量复制触发，从库 RDB 中还有数据可恢复
+
+最佳实践：
+  - Master：开启 AOF（everysec）或 RDB
+  - 至少一个 Replica：开启 RDB 或 AOF（用作冷备份）
+```
+
+---
+
+### 6.5 `replica-serve-stale-data` 三个选项详解
+
+| 值 | 行为 | 适用场景 |
+|----|------|---------|
+| **yes** | replica 失联后，继续使用本地（可能过期）的数据服务读请求 | 对数据时效性不敏感的场景（如展示型数据） |
+| **no** | replica 失联后，对所有请求返回 `SYNC with master in progress` 错误 | 对一致性要求严苛的读场景 |
+| **clients** | 复制流正常，但 replica 还没完成全量同步时（loading RDB），只有 master 创建的复制连接可通信，客户端连接返回错误 | 这是 fine-grained 控制 |
+
+**源码对应（`processCommand` 中的判断）：**
+
+```c
+// 当 replica 与 master 失联时
+if (server.masterhost &&
+    server.repl_state != REPL_STATE_CONNECTED &&
+    server.repl_serve_stale_data == 0 &&
+    !(c->cmd->flags & CMD_STALE))  // INFO 等命令除外
+{
+    addReplyError(c, "MASTERDOWN Link with MASTER is down "
+                     "and replica-serve-stale-data is set to 'no'.");
+    return C_OK;
+}
+```
+
+**面试追问：`replica-serve-stale-data clients` 和 `no` 有什么本质区别？**
+
+> `no`：只要 replica 没连上 master 就拒绝所有请求。
+> `clients`：replica 已经连上 master 但在**接收 RDB 数据/加载 RDB 期间**，拒绝客户端请求但允许复制继续。这个状态更细分，适合"不希望客户端读到老数据，但也不想因为全量复制刚开始就拒绝所有请求"的场景。
+
+---
+
+## 第七章：面试模拟——10 个高频追问（满分答案）
+
+### Q1：Redis 主从复制是全量还是增量？
+
+> **满分回答**：
+>
+> 「Redis 主从复制既有全量也有增量，它是按需切换的。
+>
+> **首次连接**或**断连后 offset 不在 backlog 范围**时走全量复制（FULLRESYNC），master fork 子进程生成 RDB 发给 replica。
+>
+> **短暂断连**时走部分复制（增量同步，PSYNC +CONTINUE），master 从 replication backlog 环形缓冲区中把断连期间的增量命令发给 replica。
+>
+> 判断能否部分复制的条件是：① replica 上报的 replid 能被 master 识别（当前 replid 或 replid2），② replica 请求的 offset 还在 master 的 backlog 覆盖范围内。这两个条件任何一个不满足就退化为全量复制。」
+
+---
+
+### Q2：全量复制期间，master 的写请求怎么处理？会丢吗？
+
+> **满分回答**：
+>
+> 「不会丢。
+>
+> 全量复制期间，master 照常处理写请求——对客户端完全透明。关键机制分两步：
+>
+> 1. **fork 后的 COW**：子进程通过写时复制机制拿到的是 fork 瞬间的数据快照，父进程（master）后续的写入不会影响子进程的 RDB 生成。
+>
+> 2. **Replication Buffer 积压**：fork 之后到 RDB 传输完成这段时间内，master 所有写命令除了正常执行外，还会被写入 client-output-buffer（replication buffer），等 RDB 传输完毕后一并发送给 replica。replica 加载完 RDB 后会回放这些 buffer 命令，最终数据一致。
+>
+> 需要补充的是，如果 RDB 太大、传输时间太长、写入又太密集，buffer 可能超过限制导致复制中断。这是工程问题，不是设计缺陷。」
+
+---
+
+### Q3：部分复制的 backlog 是什么数据结构？大小如何计算？
+
+> **满分回答**：
+>
+> 「Backlog 是一个**环形缓冲区**（circular buffer），在 Redis 源码中就是一个 `char*` 数组 + 一个全局 offset 指针。
+>
+> 工作原理：
+> - 写指针（`repl_backlog_idx`）每次写入后前移，到头后回到起点（取模）
+> - 每个字节对应的全局 offset 记录在 `repl_backlog_off` 中
+> - replica 请求的 offset 如果 < `repl_backlog_off`，说明数据已被新数据覆盖，只能全量
+>
+> 大小计算：
+> ```
+> backlog_size ≥ 预估最长断线时间（秒） × 写入速率（字节/秒） × 2
+> ```
+> 这个 ×2 是安全系数，应对写入速率波动和断线时间比预想长的情况。
+>
+> 默认 1MB 在生产环境下往往偏小。可以根据 `INFO replication` 中 `master_repl_offset` 的增长速度来精确测算。生产建议 64MB~256MB。」
+
+---
+
+### Q4：主从断开重连后，什么情况下走部分复制，什么情况下走全量复制？
+
+> **满分回答**：
+>
+> 「重连后 replica 发送 `PSYNC <replid> <offset>`，master 做两个判断：
+>
+> **条件 1——Replication ID 校验：**
+> - replica 的 replid 必须匹配 master 的 `replid` 或 `replid2`（PSYNC2）
+> - 如果不匹配（主库重启或主从切换），直接全量
+>
+> **条件 2——Offset 校验：**
+> - replica 请求的 offset 必须在 master 的 backlog 覆盖范围内
+> - offset < backlog 起始位置 → 数据已被覆盖 → 全量
+> - offset >= backlog 起始位置 → 数据还在 → 部分复制
+>
+> 用一句话总结：**主库还认识你 + 你缺的数据还在，就走增量；否则全量。**
+
+---
+
+### Q5：Redis 主从复制的原理是什么？完整流程。
+
+> **满分回答**：
+>
+> 「我分五个阶段展开：
+>
+> **阶段 1——建立连接**：replica 通过非阻塞 socket 连接 master，经过 PING/PONG、AUTH、端口上报、能力协商（REPLCONF capa）四个步骤。
+>
+> **阶段 2——同步**：replica 发送 PSYNC，master 判断全量还是部分复制。全量：fork 子进程生成 RDB，通过 buffer 积压增量命令，RDB 传完后发 buffer；部分：从 backlog 直接发增量。
+>
+> **阶段 3——RDB 加载**：replica 收到 RDB 后，清空自身数据（等价于 FLUSHALL），加载 RDB，然后回放 buffer 中的增量命令。这一步完成后 replica 数据追上了 master。
+>
+> **阶段 4——命令传播**：进入稳态，master 每执行一条写命令，就异步广播给所有 replica，写入各自的 output buffer，等待事件循环真正发送。
+>
+> **阶段 5——心跳维护**：replica 每秒向 master 发送 `REPLCONF ACK <offset>`，用于检测连接状态、汇报复制进度、辅助 min-replicas 判断。
+>
+> 整个流程是**异步**的，这意味着 Redis 主从复制是最终一致性模型。」
+
+---
+
+### Q6：从库会删除过期 key 吗？策略是什么？
+
+> **满分回答**：
+>
+> 「**从库不会主动删除过期 key。** 这是有意为之的设计。
+>
+> 原因：主从时钟可能不一致。如果 replica 因为本地时钟快了而"主动"认为一个 key 过期并删除它，而 master 上这个 key 实际上还没过期，就会产生数据不一致。
+>
+> 策略：
+> 1. Master 上的 key 过期 → master 删除 key → 向 replica 发送 `DEL <key>` → replica 执行 DEL 删除键
+> 2. Replica 读取一个已过期的 key → 返回 nil（装作 key 不存在），但**不删除它**
+> 3. 源码中 `expireIfNeeded()` 会判断 `server.masterhost != NULL`，如果是 replica 就直接返回"过期"而不执行删除
+>
+> 这个策略保证了主从数据的一致性，不依赖时钟同步。」
+
+---
+
+### Q7：主从复制有哪些延迟问题？如何监控和优化？
+
+> **满分回答**：
+>
+> 「延迟来源分三类：
+>
+> **1. 网络延迟**：master 到 replica 的 RTT。跨机房可能 1~10ms，同机房 < 1ms。通过 `redis-cli --latency` 监控。
+>
+> **2. 复制延迟（lag）**：replica 执行复制命令的延迟。通过 `INFO replication` 中 `master_repl_offset - slave_repl_offset` 判断。原因通常是 replica 的读请求太多把单线程打满了。
+>
+> **3. 全量复制延迟**：fork 阻塞 + RDB 生成 + RDB 传输 + RDB 加载。大实例可达数十分钟。
+>
+> 监控手段：
+> ```bash
+> # 在 master 查看每个 replica 的 lag
+> redis-cli INFO replication | grep lag
+>
+> # 计算 offset 差距
+> echo "Master offset: $(redis-cli -p 6379 INFO replication | grep master_repl_offset | cut -d: -f2)"
+> echo "Replica offset: $(redis-cli -p 6380 INFO replication | grep slave_repl_offset | cut -d: -f2)"
+>
+> # Prometheus 指标
+> redis_master_repl_offset
+> redis_slave_repl_offset
+> redis_connected_slaves
+> ```
+>
+> 优化：
+> - 级别 1：增加 replica 机器数量和质量
+> - 级别 2：客户端做读请求分流（感知主从拓扑）
+> - 级别 3：级联复制，减少 master 的广播压力
+> - 级别 4：拆分大 key / 大实例」
+
+---
+
+### Q8：为什么建议 Redis 主从都开启持久化？
+
+> **满分回答**：
+>
+> 「这是一个血泪教训总结出来的结论。
+>
+> **场景推演**：如果主库不开启持久化，某天主库进程重启（OOM、运维误操作），内存空了。所有 replica 连接上来，触发全量复制，收到空的 RDB，清空自己的数据，加载空 RDB。**所有数据永久丢失。**
+>
+> 即使 replica 开启了持久化，在「全量复制 → 清空数据 → 加载空 RDB」这个过程中，replica 上的旧数据也会被覆盖掉。除非你在检测到异常时及时备份了 replica 的 RDB 文件。
+>
+> 所以：
+> - **主库必须开持久化**（防自己重启连累所有 replica）
+> - **至少一个从库开持久化**（作为最后的救命稻草）
+>
+> 这里的持久化可以是 RDB 或 AOF，两者选一个即可，当然都开最好。」
+
+---
+
+### Q9：`replica-serve-stale-data` 三个选项有什么区别？
+
+> **满分回答**：
+>
+> 「这个参数控制 replica 在与 master 断开连接时的行为：
+>
+> - **yes（默认）**：继续用本地数据服务读请求。适合对数据新鲜度不敏感的场景。风险：可能读到过期很久的数据。
+>
+> - **no**：直接返回 `MASTERDOWN` 错误，什么请求都不处理（除了 INFO 等特殊命令）。适合一致性优先的场景。
+>
+> - **clients**（Redis 6.2+）：与 no 类似，但更精细——只在 replica 正在做全量同步（loading RDB）时才拒绝请求。一旦 RDB 加载完成进入命令传播阶段，客户端就可以读取数据了。而 no 在 loading 期间和断连期间都拒绝。
+>
+> 源码中的区分点在于判断的是 `repl_state != REPL_STATE_CONNECTED`（no 模式）还是 `repl_state == REPL_STATE_TRANSFER`（clients 模式）。
+>
+> 实际生产中最常用的是 yes 和 no。为了绝对一致性选 no，为了可用性选 yes。」
+
+---
+
+### Q10：如果让你设计一个 Redis 全量同步的优化方案，你怎么做？
+
+> **满分回答**：
+>
+> 「我会从四个维度优化：
+>
+> **1. 无盘 + 流式传输（Redis 已实现 `repl-diskless-sync`）**
+> RDB 生成时不写磁盘，直接流式发给 replica。省去磁盘 I/O 环节，传输和生成并行。
+>
+> **2. RDB 增量生成（Redis 未实现）**
+> 当前每次全量复制都要 fork 生成完整 RDB。如果多个 replica 在相近时间请求全量复制，可以复用同一次 fork 的结果（`repl-diskless-sync-delay` 部分做到了）。更进一步：维护一个"实时 RDB 生成线程"，不需要每次 fork。
+>
+> **3. 断点续传（Redis 未实现）**
+> 如果传输中断（已经发了 8GB/10GB），不要从头开始，而是从断点继续发。需要在 replica 侧维护一个临时接收文件。
+>
+> **4. Replica 预热**
+> 利用已有的 RDB 备份文件（如定时备份到 S3），新 replica 先加载备份 RDB，再向 master 请求增量（offset 从备份文件的 offset 开始）。把全量同步的时间从"全网传输"缩短为"增量追赶"。
+>
+> 这里面**无盘复制**和**断点续传**的工程收益最大。无盘复制 Redis 已实现，断点续传目前需要自研。」
+
+---
+
+## 第八章：全景架构总结
+
+### 8.1 全景架构图
+
+```mermaid
+graph TB
+    subgraph Client
+        CLI[客户端]
+    end
+
+    subgraph Master_Processes
+        CMD_EXEC[命令执行<br/>processCommand]
+        PROPAGATE[命令传播<br/>propagateNow]
+        BACKLOG_WRITE[写入 Backlog<br/>feedReplicationBacklog]
+        REPL_BUFFER[写入 Replica Buffer<br/>addReply]
+    end
+
+    subgraph Master_Data_Structures
+        OFFSET_M[(Master Offset<br/>全局递增)]
+        BACKLOG[(Replication Backlog<br/>环形缓冲区 1~256MB)]
+        REPLID_M[(Replication ID<br/>replid / replid2)]
+    end
+
+    subgraph Transmission
+        FULL[全量复制<br/>FULLRESYNC<br/>fork → RDB → Buffer]
+        PARTIAL[部分复制<br/>CONTINUE<br/>Backlog → 增量命令]
+        SYNC_LOOP[命令传播<br/>异步广播每条写命令]
+        HEARTBEAT[心跳<br/>REPLCONF ACK offset<br/>每秒]
+    end
+
+    subgraph Replica_Side
+        RCV[接收并执行命令]
+        OFFSET_R[(Replica Offset<br/>已同步到的位置)]
+        REPLID_R[(缓存的 Master Replid)]
+        STALE[replica-serve-stale-data<br/>控制失联时的读行为]
+    end
+
+    CLI -->|SET key val| CMD_EXEC
+    CMD_EXEC --> PROPAGATE
+    PROPAGATE --> BACKLOG_WRITE
+    PROPAGATE --> REPL_BUFFER
+    BACKLOG_WRITE --> BACKLOG
+    REPL_BUFFER --> FULL
+    REPL_BUFFER --> SYNC_LOOP
+    BACKLOG --> PARTIAL
+
+    OFFSET_M --- BACKLOG
+    REPLID_M --- PARTIAL
+
+    FULL -->|RDB + Buffer| RCV
+    PARTIAL -->|增量命令| RCV
+    SYNC_LOOP -->|异步命令流| RCV
+
+    RCV --> OFFSET_R
+    RCV --> REPLID_R
+    RCV --> STALE
+
+    HEARTBEAT -->|Replica → Master / offset| OFFSET_M
+
+    style FULL fill:#ffd43b,stroke:#333
+    style PARTIAL fill:#69db7c,stroke:#333
+    style SYNC_LOOP fill:#74c0fc,stroke:#333
+    style HEARTBEAT fill:#da77f2,stroke:#333
+```
+
+### 8.2 一页纸总结（面试前 5 分钟复习）
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          Redis 主从复制 核心要点                               │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  【三大价值】读写分离 → 读 QPS 水平扩展 / 数据冗余 → 多副本可靠 / 为哨兵集群铺路     │
+│                                                                             │
+│  【配置】REPLICAOF <ip> <port>（Redis 5.0+） / replica-read-only yes 不要改    │
+│                                                                             │
+│  【复制流程 5 阶段】                                                            │
+│    1. 连接 → PING/AUTH/端口/能力协商（4 步握手状态机）                            │
+│    2. 同步 → PSYNC → FULLRESYNC 或 CONTINUE                                  │
+│    3. 全量 → fork(COW) + RDB + Buffer 积压 → replica 清空+加载+回放              │
+│    4. 部分 → backlog 中取增量命令（replid 匹配 + offset 在范围内）                 │
+│    5. 稳态 → 异步命令传播 + 每秒心跳 REPLCONF ACK                                │
+│                                                                             │
+│  【三大数据结构】replid + offset + backlog（环形缓冲区）                            │
+│                                                                             │
+│  【关键判断：全量 vs 部分】                                                       │
+│    全量：首次连接 / 主库重启 replid 变化 / offset 超出 backlog 范围                │
+│    部分：replid 匹配（含 replid2）+ offset 在 backlog 内                          │
+│                                                                             │
+│  【PSYNC2 改进】replid2 备份旧 replid，主库重启后 replica 仍可部分复制               │
+│                                                                             │
+│  【Backlog 公式】backlog_size ≥ 断线时长 × 写入速率 × 2，默认 1MB 太小说对了          │
+│                                                                             │
+│  【一致性模型】异步复制 = 最终一致性，不是强一致性                                    │
+│     - min-replicas-to-write 只保证「至少有 N 个 replica 存活」，不保证「已确认收到」   │
+│     - 这也是为什么 Redis 叫 AP 系统                                              │
+│                                                                             │
+│  【常见事故】                                                                  │
+│    1. 延迟增大 → 从库读太多，单线程阻塞                                             │
+│    2. 主库重启 → 全量复制雪崩（用 PSYNC2 + 级联复制解决）                             │
+│    3. Buffer 溢出 → 全量复制无限失败（增大 buffer + 无盘复制）                        │
+│    4. 复制风暴 → 太多 replica 直连 master（用级联复制分摊）                            │
+│                                                                             │
+│  【必背配置】                                                                  │
+│    增大 backlog（≥64MB） / 增大 buffer（大实例） / repl-diskless-sync（磁盘慢）       │
+│    min-replicas-to-write ≥ 1（高可靠） / repl-timeout = 30s（内网）               │
+│                                                                             │
+│  【面试必答】主从复制是异步的，牺牲一致性换性能；部分复制靠 backlog 实现增量；             │
+│             PSYNC2 靠 replid2 解决主库重启后全量复制雪崩                              │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 附录：速查命令
+
+```bash
+# 查看复制状态（主/从通用）
+redis-cli INFO replication
+
+# 查看主从延迟（在 master 上执行）
+redis-cli INFO replication | grep -E "lag|offset"
+
+# 查看复制历史
+redis-cli INFO stats | grep repl
+
+# 手动触发主从切换
+redis-cli REPLICAOF NO ONE          # 断开主从关系，提升为 master
+
+# 查看所有连接的客户端
+redis-cli CLIENT LIST | grep slave
+
+# 实时监控 QPS
+redis-cli --stat
+
+# 网络延迟测试
+redis-cli --latency -h <master_ip>
+```

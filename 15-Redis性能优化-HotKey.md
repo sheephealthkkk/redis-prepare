@@ -24,11 +24,11 @@
 | 维度 | BigKey | HotKey |
 |------|--------|--------|
 | **衡量** | key 值大/元素多 | 访问频率高 |
-| **危害** | 操作阻塞、内存大、删除慢 | 单个节点过载、CPU 失衡 |
+| **危害** | 操作阻塞、内存大、删除慢:rocket: | 单个节点过载、CPU 失衡:rocket: |
 | **发现** | SCAN + MEMORY USAGE | 客户端统计 / Redis 命令统计 |
-| **解决** | 拆分/UNLINK | 多级缓存/本地缓存/读写分离 |
+| **解决** | 拆分/UNLINK | 多级缓存/本地缓存/读写分离:rocket::rocket: |
 
-一个 key 可以同时是 BigKey 也是 HotKey（最危险的情况）。
+一个 key 可以同时是 BigKey 也是 HotKey（最危险的情况）。:rocket::rocket；
 
 ---
 
@@ -58,7 +58,7 @@ Cluster 模式下：
 
 ## 第三章：如何发现 HotKey？
 
-### 3.1 客户端统计（最直接）
+### 3.1 客户端统计（最直接）:rocket::rocket::rocket::rocket::rocket:
 
 ```java
 /**
@@ -221,7 +221,9 @@ config.useMasterSlaveServers()
     .setReadMode(ReadMode.SLAVE);  // 读从 Slave 读
 ```
 
-### 4.3 方案三：热点数据复制（多份缓存）
+### 4.3 方案三：热点数据复制（多份缓存）:rocket::rocket::rocket::rocket::rocket:
+
+### 问题出在 **“所有请求都压在一个节点的一个 key 上”** ，那就把这个 key **复制多份**，分散到多个节点（甚至同节点的不同 key），让客户端读的时候**随机选择其中一个副本**。
 
 ```
 思路：热 key 在 Redis 中存多份副本，请求随机选一份读取。
@@ -258,6 +260,22 @@ public Product getProductWithReplicas(String productId, int replicas) {
     }
     return product;
 }
+```
+
+预先在缓存里存多份：
+
+```
+hot_key:1
+hot_key:2
+hot_key:3
+hot_key:4
+```
+
+客户端在访问时，先随机生成一个 1~4 的数字，拼出完整的 key 去读。例如：
+
+```
+副本号 = random(1, 4)
+GET hot_key:{副本号}
 ```
 
 ### 4.4 方案四：将热 key 提前预热

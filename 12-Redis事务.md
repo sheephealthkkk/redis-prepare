@@ -13,7 +13,7 @@
   Redis 事务：    打包执行，但不支持回滚！
 ```
 
-**Redis 事务的本质是：把一组命令排队，一次性按序执行，执行期间不被其他客户端的命令打断。**
+**Redis 事务的本质是：把一组命令排队，一次性按序执行，执行期间不被其他客户端的命令打断。**:rofl::rofl::rofl::rofl::rofl:
 
 ---
 
@@ -48,7 +48,7 @@
         │                                     │     返回每条命令的执行结果
 ```
 
-**关键理解：** MULTI 之后，每条命令 Redis 都**不执行**——只是返回 `QUEUED` 表示"已加入队列"。直到 EXEC 才真正执行，而且是一次性、不间断地执行完所有排队的命令。
+**关键理解：** MULTI 之后，每条命令 Redis 都**不执行**——只是返回 `QUEUED` 表示"已加入队列"。直到 EXEC 才真正执行，而且是一次性、不间断地执行完所有排队的命令。:rocket::rocket:
 
 ### 1.3 Java 示例
 
@@ -96,7 +96,7 @@ public void basicTransaction(Jedis jedis) {
 
 ### 1.5 事务中的错误处理——不！会！回！滚！
 
-这是 Redis 事务和 MySQL 事务最大的区别：
+这是 Redis 事务和 MySQL 事务最大的区别：:rocket:
 
 ```
 情况 1：命令语法错误（MULTI 之前就检测到）
@@ -190,7 +190,7 @@ antirez："Redis is not a toy, it's simple. Simplicity is a feature."
 
 ### 1.7 Redis 事务到底有多少"ACID"？
 
-面试中如果能从 ACID 四个维度分析 Redis 事务，会展现很深的理解力：
+面试中如果能从 ACID 四个维度分析 Redis 事务，会展现很深的理解力：:rofl::rofl::rofl::rofl:
 
 ```
 A（原子性 Atomicity）：
@@ -224,7 +224,7 @@ D（持久性 Durability）：
 
 ### 2.1 问题：事务之间怎么防止冲突？
 
-Redis 事务 EXEC 期间是原子的（不会被插入），但 MULTI 到 EXEC 这段"排队时间"内，**其他客户端是可以执行命令的**。
+Redis 事务 EXEC 期间是原子的（不会被插入），但 MULTI 到 EXEC 这段"排队时间"内，**其他客户端是可以执行命令的**。:rocket::rofl::rofl:
 
 ```
 Client-A                          Client-B
@@ -240,7 +240,7 @@ Client-A                          Client-B
   实际结果：counter = 13（Client-B 覆盖了 A 的修改！）
 ```
 
-### 2.2 WATCH —— Redis 的乐观锁
+### 2.2 WATCH —— Redis 的乐观锁:rocket::rocket:
 
 **WATCH 是一种乐观锁机制：监视某个 key，如果在 EXEC 之前这个 key 被其他客户端改过，EXEC 就拒绝执行。**
 
@@ -338,7 +338,7 @@ WATCH 扣库存：
 
 ## 第三章：Pipeline、Transaction、Lua —— 如何选？
 
-### 3.1 Pipeline —— 纯批量，不原子
+### 3.1 Pipeline —— 纯批量，不原子:rocket:我还以为是原子呢:rocket::rocket::rofl::rofl:
 
 ```
 Pipeline：
@@ -357,6 +357,11 @@ pipeline.lpush("list", "a");
 pipeline.sync();  // 发送所有命令，接收所有回复
 ```
 
+- **适用场景举例**
+  - 批量设置 10 万个用户的在线状态（`SET user:1:online 1 ...`），无需顺序性。
+  - 一次读取多个 hash 的字段，减少查库延迟。
+  - 预热缓存时批量写入大量数据。
+
 ### 3.2 Transaction —— 打包原子，排队执行
 
 ```
@@ -365,6 +370,11 @@ Transaction（MULTI/EXEC）：
 
   特点：原子、串行、不支持回滚、不能根据中间结果做条件判断。
 ```
+
+- **适用场景举例**
+  - 转账操作：通过 `WATCH` 监视账户余额，若余额未被改动则执行扣款和加款，否则重试（乐观锁）。
+  - 批量更新多个键，只要求中间不被插队，不要求出错回滚。
+  - 需要简单原子性但无需返回值判断的操作。
 
 ### 3.3 Lua —— 灵活脚本，服务端原子
 
@@ -390,6 +400,12 @@ Long result = (Long) jedis.eval(lua,
     Collections.emptyList());
 // result = 1（成功） 或 0（库存不足）
 ```
+
+- **适用场景举例**
+  - **分布式锁释放**：先判断锁的值是否匹配，再决定是否删除（避免误删他人锁）。
+  - **限流算法**：如滑动窗口、令牌桶等，需要原子地统计计数、比较、更新。
+  - **库存扣减**：先查询库存，若足够则扣减，保证不超卖。
+  - **复合缓存更新**：例如同时更新缓存和数据库的标记，保持一致性。
 
 ### 3.4 三种方案对比
 
