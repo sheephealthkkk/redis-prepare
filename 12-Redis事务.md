@@ -2,6 +2,8 @@
 
 ---
 
+pipelinr,transation,lua
+
 ## 前言：Redis 事务和 MySQL 事务完全不是一回事
 
 很多 Java 程序员对"事务"的第一反应是 MySQL 的 ACID：要么全成功，要么全回滚。如果你带着这个预期去看 Redis 事务，会非常困惑。
@@ -17,7 +19,7 @@
 
 ---
 
-## 第一章：基本事务 —— MULTI / EXEC / DISCARD
+## 第一章：基本事务 —— MULTI / EXEC / DISCARD:o::o::o::o::o::o:
 
 ### 1.1 事务的三个命令
 
@@ -48,7 +50,7 @@
         │                                     │     返回每条命令的执行结果
 ```
 
-**关键理解：** MULTI 之后，每条命令 Redis 都**不执行**——只是返回 `QUEUED` 表示"已加入队列"。直到 EXEC 才真正执行，而且是一次性、不间断地执行完所有排队的命令。:rocket::rocket:
+**关键理解：** MULTI 之后，每条命令 Redis 都**不执行**——只是返回 `QUEUED` 表示"已加入队列"。直到 EXEC 才真正执行，而且是一次性、不间断地执行完所有排队的命令。:rocket::rocket::o::o::o::o::o::o::o::o::o::o::o::o::o::o::o::o::o::o::o::o::o::o::o::o::o::o::o::o::o:
 
 ### 1.3 Java 示例
 
@@ -94,7 +96,7 @@ public void basicTransaction(Jedis jedis) {
      所有排队命令作为一个"不可分割的整体"执行。
 ```
 
-### 1.5 事务中的错误处理——不！会！回！滚！
+### 1.5 事务中的错误处理——不！会！回！滚！:o::o:
 
 这是 Redis 事务和 MySQL 事务最大的区别：:rocket:
 
@@ -136,7 +138,7 @@ public void basicTransaction(Jedis jedis) {
 
 这是面试中的高频追问。antirez（Redis 作者）在官方文档中给出了明确的解释：
 
-**原因一（官方）：Redis 命令失败 = 编程错误，应该在开发阶段暴露**
+**原因一（官方）：Redis 命令失败 = 编程错误，应该在开发阶段暴露**:o::o::o::o::o::o::o::o::o::o::o:
 
 ```
 MySQL 事务回滚的场景：
@@ -338,7 +340,7 @@ WATCH 扣库存：
 
 ## 第三章：Pipeline、Transaction、Lua —— 如何选？
 
-### 3.1 Pipeline —— 纯批量，不原子:rocket:我还以为是原子呢:rocket::rocket::rofl::rofl:
+### 3.1 Pipeline —— 纯批量，不原子:rocket:我还以为是原子呢:rocket::rocket::rofl::rofl::o::o::o::o:
 
 ```
 Pipeline：

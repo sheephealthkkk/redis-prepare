@@ -233,7 +233,7 @@ do {
 |--------|---------|
 | KEYS * | SCAN 分批迭代 |
 | DEL bigKey | UNLINK 异步删除 |
-| SAVE | BGSAVE（fork 子进程） |
+| SAVE | BGSAVE（fork 子进程）异步 |
 | SMEMBERS / HGETALL 大集合 | SSCAN / HSCAN 分批 |
 | LRANGE key 0 -1 | LRANGE key 0 99 分页 |
 | ZRANGE 大 offset | 按 score 范围查替代 offset |

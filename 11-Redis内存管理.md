@@ -63,7 +63,9 @@ SETEX hot:article:123 3600 ""        # 1 小时后自动刷新
 
 ## 第二章：Redis 如何判断一个 key 是否过期？
 
-### 2.1 过期字典——expires dict:rocket::rocket::rocket::rofl::rofl::rofl:
+### 2.1 过期字典——expires dict:rocket::rocket::rocket::rofl::rofl::rofl::o::o::o::o::o::o::o::o::o::o:
+
+它的数据结构和set集合里面的dict是一样的，也是dict有两个哈希表，哈希表里面就是桶数组，数组链接链表:o::o::o:
 
 Redis 内部**不把过期时间存在 key 本身上**，而是单独维护了一张"过期字典"（expires dict）。
 
@@ -89,7 +91,7 @@ Redis 内部的两套结构：
 // value = 过期时间戳（Unix 毫秒）
 ```
 
-### 2.2 判断过期的内部逻辑:rocket::rofl:
+### 2.2 判断过期的内部逻辑
 
 ```
 判断一个 key 是否过期：
@@ -127,7 +129,7 @@ Redis 内部的两套结构：
 
 ### 3.2 策略二：定期删除（Active Expire）
 
-**思路：** 每隔一段时间，随机抽查一部分 key:rofl::rofl:，发现过期的删掉。
+**思路：** 每隔一段时间，随机抽查一部分 key​​，发现过期的删掉。
 
 ```
 定期删除的执行入口：
@@ -194,7 +196,7 @@ Redis 内部的两套结构：
       → 综合效果：Redis 响应变慢 → 延迟抖动
 ```
 
-### 4.2 解决方案
+### 4.2 解决方案:o::o::o::o::o::o::o::o::o::o::o:
 
 **方案一：TTL 加随机偏移（同缓存雪崩预防）**
 
@@ -259,7 +261,7 @@ Redis 提供了 8 种策略，分成三大类：:rofl::rofl::rofl::rofl::rofl::
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### 5.3 allkeys vs volatile——什么时候选哪个:rofl::rofl::rofl:
+### 5.3 allkeys vs volatile——什么时候选哪个:rofl::rofl::rofl::o::o::o::o::o:
 
 ```
 allkeys-xxx：缓存场景（推荐）
@@ -403,7 +405,7 @@ Redis 的 LFU 用了一个巧妙的方法——把本来用于 LRU 的 24-bit lr
      之前频率高但最近不怎么访问的 → 计数器持续衰减 → 最终被淘汰
 ```
 
-### 5.8 淘汰策略选型建议:rofl::rofl:
+### 5.8 淘汰策略选型建议:rofl::rofl::o::o::o::o::o::o::o::o::o::o::o::o::o::o::o::o::o::o::o:
 
 | 场景 | 推荐策略 | 原因 |
 |------|---------|------|
@@ -461,7 +463,7 @@ Master 上的过期流程：
   → Slave 不自己判断"key是否过期"，完全由 Master 的 DEL 命令控制
 ```
 
-### 6.3 Slave 如何处理读请求（过期保护）:rofl::rofl::rofl::rofl::rofl:
+### 6.3 Slave 如何处理读请求（过期保护）:rofl::rofl::rofl::rofl::rofl::o::o::o::o::o::o::o::o::o::o::o:
 
 ```
 关键问题：如果 Slave 收到客户端的读请求（READ 命令），

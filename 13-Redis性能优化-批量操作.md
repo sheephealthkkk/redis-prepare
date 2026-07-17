@@ -1,8 +1,12 @@
 # Redis 性能优化——批量操作与减少网络传输
 
+
+
 ---
 
-## 前言：Redis 性能瓶颈到底在哪里？
+## 前言:批量指令，pipeline，lua
+
+## ：Redis 性能瓶颈到底在哪里？
 
 Redis 单机 10w+ QPS 是操作内存的速度。但实际业务中，你往往达不到这个数字——瓶颈不在 Redis 本身，而在 **网络**。
 
@@ -373,7 +377,7 @@ pipeline是非原子的
 
 ### 2.2 Pipeline 的本质——TCP 层面的批量:rocket::rocket::rocket::rofl::rofl::rofl::rofl:
 
-Pipeline 不是 Redis 的"功能"，而是**利用 TCP 连接全双工特性的客户端技巧**：
+Pipeline 不是 Redis 的"功能"，而是**利用 TCP 连接全双工特性的客户端技巧**:o::o::o:
 
 ```
 Pipeline 的工作方式：
@@ -482,7 +486,7 @@ public void batchGetWithLettuce(LettuceConnection connection, List<String> keys)
 | 维度 | MGET/MSET | Pipeline |
 |------|-----------|----------|
 | **命令类型** | 只能同一种（MGET 只能 GET） | 可以混合（GET + SET + INCR...） |
-| **原子性** | MSET 是原子的 | 不保证原子 |
+| **原子性** | MSET 是原子的 | 不保证原子:o::o::o::o: |
 | **Cluster** | 只能同 slot | 同 slot 跨 slot 都可以（客户端路由）:rofl::rofl: |
 | **速度** | 略快（服务端一次处理） | 略慢（服务端逐条处理） |
 | **灵活性** | 低 | **高** |

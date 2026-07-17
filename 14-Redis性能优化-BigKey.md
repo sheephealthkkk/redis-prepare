@@ -6,7 +6,7 @@
 
 ### 1.1 定义——不是"占内存大"，是"操作开销不成比例"
 
-Redis 官方说的 **bigkey**，不是指“这个 key 占用了 10GB 内存”，而是指**一个 key 对应的数据结构中包含的元素数量太多**
+Redis 官方说的 **bigkey**，不是指“这个 key 占用了 10GB 内存”，而是指**:o::o::o::o::o::o::o::o::o::o::o::o:一个 key 对应的数据结构中包含的元素数量太多**
 
 所以 bigkey 的核心特征是 **“元素多”** ，而不是单纯 **“内存大”**。
 
@@ -130,7 +130,7 @@ Set BigKey (> 512 元素或有字符串):
 
 ### 2.2 危害详解——每个危害对应哪些命令
 
-#### 危害 1：特定命令严重阻塞主线程:rocket:
+#### 危害 1：特定命令严重阻塞主线程:rocket::o::o::o::o::o::o::o::o::o::o::o::o::o::o::o::o:
 
 ```
 每种类型的 BigKey 对应的"危险命令"：
@@ -165,7 +165,7 @@ Set BigKey (> 512 元素或有字符串):
     危险度：★★★★★
 ```
 
-#### 危害 2：网络带宽被打爆
+#### 危害 2：网络带宽被打爆:o::o:
 
 ```
 场景：一个热门接口每次返回一个 5MB 的 String BigKey
@@ -177,7 +177,7 @@ Set BigKey (> 512 元素或有字符串):
             小 key 的请求被"挤"得超时
 ```
 
-#### 危害 3：删除时产生的延迟毛刺（latency spike）:rocket::rofl:
+#### 危害 3：删除时产生的延迟毛刺（latency spike）:rocket::rofl::o:
 
 这是生产环境排查"Redis 偶尔响应慢"最容易被忽视的原因：
 
@@ -209,7 +209,7 @@ BigKey 的影响：
   ③ RDB 传输：RDB 文件巨大 → 网络传输几十 GB → Slave 很久才能追上 Master
 ```
 
-#### 危害 5：内存碎片加剧
+#### 危害 5：内存碎片加剧:o::o:
 
 ```
 BigKey 经常被修改（如 List 的频繁 LPUSH + LPOP + LTRIM）：
@@ -423,7 +423,7 @@ public class BigKeyAccessAspect {
 
 ## 第四章：如何处理 BigKey？
 
-### 4.1 处理决策树
+### 4.1 处理决策树:o::o::o::o:
 
 ```
 发现 BigKey 后怎么办？
@@ -447,7 +447,9 @@ public class BigKeyAccessAspect {
      └─ 数据不需要了 → UNLINK
 ```
 
-### 4.2 方案一：异步删除 UNLINK（最优先使用）
+### 4.2 方案一：异步删除 UNLINK（最优先使用）:o::o::o::o::o::o::o:
+
+del是同步阻塞，unlike是异步删除，即逻辑标记已经删除快速返回，异步开启一个线程实际删除
 
 ```bash
 # ❌ DEL：阻塞（主线程遍历所有元素逐个 free）
@@ -566,7 +568,8 @@ ZSet│ ZADD rank:global ［1亿分］   │ ZADD rank:daily:2026-05-26
 ```
 
 **拆分原则：**
-- Hash / Set / ZSet：按 ID 取模 / CRC32 哈希分桶:rocket::rocket:
+
+- Hash / Set / ZSet：按 ID 取模 / CRC32 哈希分桶:rocket::rocket::o::o::o::o::o::o::o::o::o::o::o::o::o::o::o:
 - 时间序列数据：按日期/小时拆分 → 旧 key 自然过期清理
 - String：按业务维度拆（如分页、分段）:rocket:
 
